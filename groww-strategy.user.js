@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Groww Strategy View
 // @namespace    local.groww-strategy
-// @version      1.7.0
+// @version      1.8.1
 // @description  Current one-minute rises among 15-minute gainers, strict results exclusion, and Groww OTM call comparisons. Read-only research.
 // @match        https://groww.in/futures-and-options/top-gainers*
 // @connect      groww.in
@@ -25,6 +25,7 @@ function quoteTime(value) {
   return n>0?n<100_000_000_000?n*1000:n:null;
 }
 function quoteFresh(quote,time,age=30_000) {
+  if(quote?.priceError)return false;
   const t=quote?.quoteAt;
   return Number.isFinite(t) && t<=time+10_000 && time-t<=age &&
     t>=Date.parse(`${istDay(time)}T09:15:00+05:30`) && istDay(t)===istDay(time);
@@ -174,8 +175,8 @@ function resultsCheck(stock, calendar, window, time) {
   return {pass:matches.length===0, unknown:false, label:labels.join(" · ") || "No results in window", events:matches};
 }
 function resultsAllowed(stock, calendar, window, time) {return resultsCheck(stock,calendar,window,time).pass;}
-function stockCheck(stock, calendar, window, time, settings = DEFAULTS) {
-  const results = resultsCheck(stock,calendar,window,time);
+function stockCheck(stock, calendar, window, time, settings = DEFAULTS, checkedResults = null) {
+  const results = checkedResults || resultsCheck(stock,calendar,window,time);
   const dayPass = stock.dayPct !== null && above(stock.dayPct,settings.minDay);
   const dayLabel = stock.dayPct === null ? "Day change unavailable" : stock.dayPct < 0 ? "Negative today" :
     stock.dayPct === 0 ? "Flat today" : !dayPass ? `Below +${settings.minDay}%` : null;
@@ -184,22 +185,44 @@ function stockCheck(stock, calendar, window, time, settings = DEFAULTS) {
   if (!fresh) reasons.push(stock.priceError || "Groww quote stale or unavailable");
   return {pass:dayPass && results.pass && stock.spot > 0 && fresh, results, reasons};
 }
-const SIGNAL_VERSION = 3;
+const SIGNAL_VERSION = 4;
 const SPIKE_THRESHOLDS = Object.freeze({one:1,five:2,confirmationMs:10_000,maxGapMs:30_000,rearmMs:MINUTE,retentionMs:15*MINUTE});
-const unreadyReturn = () => ({ready:false,pct:null});
+const unreadyReturn = (reason="warming",extra={}) => ({ready:false,pct:null,reason,coverageReason:reason,anchorOffsetSeconds:null,...extra});
 function windowStart(samples,windowMs,end) {
   if (!samples.length || samples[0].t>end-windowMs) return -1;
   const index=samples.findIndex(p=>p.t>=end-windowMs);
   return index>=0 && samples[index].t<=end-windowMs+10_000 ? index : -1;
 }
 function rollingChange(samples, windowMs, now, interval = 10_000) {
-  if (!samples.length || samples[0].t>now-windowMs || samples.at(-1).t!==now) return unreadyReturn();
+  if (!samples.length || samples[0].t>now-windowMs) return unreadyReturn();
+  if (samples.at(-1).t!==now) return unreadyReturn("unavailable");
   const index=samples.findIndex(p=>p.t>=now-windowMs);
-  if (index<0 || samples[index].t>now-windowMs+interval || !(samples[index].p>0)) return unreadyReturn();
-  for (let i=index+1;i<samples.length;i++) if (samples[i].t-samples[i-1].t>30_000) return unreadyReturn();
+  if (index<0 || samples[index].t>now-windowMs+interval || !(samples[index].p>0)) return unreadyReturn("missing-anchor");
+  for (let i=index+1;i<samples.length;i++) if (samples[i].t-samples[i-1].t>30_000) return unreadyReturn("gap");
   const start=samples[index],end=samples.at(-1);
   return {ready:true,pct:(end.p/start.p-1)*100,seconds:(end.t-start.t)/1000,
-    startAt:start.t,endAt:end.t,startPrice:start.p,endPrice:end.p};
+    startAt:start.t,endAt:end.t,startPrice:start.p,endPrice:end.p,
+    anchorOffsetSeconds:(start.t-(now-windowMs))/1000,reason:"complete",coverageReason:"complete"};
+}
+// Use real source observations on either side of the one-minute boundary. A full
+// minute must already have been collected, even when the closest anchor is newer.
+// rollingChange remains the strict historical policy for longer context/baseline.
+function oneMinuteChange(samples, now, interval = 10_000) {
+  const target=now-MINUTE;
+  if (!samples.length || samples[0].t>target) return unreadyReturn();
+  if (samples.at(-1).t!==now) return unreadyReturn("unavailable");
+  let index=-1,distance=Infinity;
+  for(let i=0;i<samples.length;i++) {
+    const offset=Math.abs(samples[i].t-target);
+    if(offset<=interval && (offset<distance || (offset===distance && samples[i].t<samples[index]?.t))) {index=i;distance=offset;}
+  }
+  if(index<0 || !(samples[index].p>0))return unreadyReturn("missing-anchor");
+  for(let i=index+1;i<samples.length;i++)if(samples[i].t-samples[i-1].t>30_000)return unreadyReturn("gap");
+  const anchor=samples[index],end=samples.at(-1);
+  if(!(end.p>0))return unreadyReturn("unavailable");
+  return {ready:true,pct:(end.p/anchor.p-1)*100,seconds:(end.t-anchor.t)/1000,
+    startAt:anchor.t,endAt:end.t,startPrice:anchor.p,endPrice:end.p,
+    anchorOffsetSeconds:(anchor.t-target)/1000,reason:"complete",coverageReason:"complete"};
 }
 function accelerationPattern(samples,now) {
   if (!rollingChange(samples,3*MINUTE,now).ready) return {ready:false,hit:false,returns:[]};
@@ -281,13 +304,13 @@ class SpikeEngine {
       }
       s.samples.push({t:observed,p:stock.spot});
       s.samples=s.samples.filter(p=>p.t>=observed-910_000);
-      const one=rollingChange(s.samples,MINUTE,observed),five=rollingChange(s.samples,5*MINUTE,observed);
+      const one=oneMinuteChange(s.samples,observed),five=rollingChange(s.samples,5*MINUTE,observed);
       const oneHit=one.ready && atLeast(one.pct,1);
       const active=oneHit;
       s.oneReadings=(s.oneReadings || []).filter(p=>p.observedAt>=observed-MINUTE);
       if(one.ready)s.oneReadings.push({...one,observedAt:observed});
       s.events=s.events.filter(e=>now-e.lastSeen<15*MINUTE);
-      observeBaseline(s,key,one,five,observed,now,gap);
+      observeBaseline(s,key,rollingChange(s.samples,MINUTE,observed),five,observed,now,gap);
       if (active) {
         if(s.run && !s.run.confirmedAt && observed-s.run.firstSeen>30_000) {
           this.transition(stock,"rejected",observed,{runId:s.run.id,reason:"Confirmation window elapsed"});s.run=null;
@@ -338,9 +361,14 @@ class SpikeEngine {
   view(stock,now) {
     const s=this.day===istDay(now)?this.states[stockKey(stock)]:null,recent=s?.samples.at(-1)?.t;
     const valid=!!recent && !s.quoteConflict && now-recent<=30_000 && recent<=now+10_000 && (!stock.priceSource || (quoteFresh(stock,now) && stock.quoteAt===recent && stock.spot===s.samples.at(-1).p));
-    const one=valid?rollingChange(s.samples,MINUTE,recent):unreadyReturn();
-    const five=valid?rollingChange(s.samples,5*MINUTE,recent):unreadyReturn();
-    const fifteen=valid?rollingChange(s.samples,15*MINUTE,recent):unreadyReturn();
+    const invalidInput=stock.priceSource && !quoteFresh(stock,now);
+    const invalidReason=s?.quoteConflict || stock.quoteConflictAt?"inconsistent":invalidInput?
+      (Number.isFinite(stock.quoteAt) && now-stock.quoteAt>30_000?"stale":"unavailable"):
+      !recent?"warming":now-recent>30_000?"stale":"inconsistent";
+    const one=valid?oneMinuteChange(s.samples,recent):unreadyReturn(invalidReason);
+    if(valid && one.reason==="warming" && s.lastGap) {one.reason="gap";one.coverageReason="gap";}
+    const five=valid?rollingChange(s.samples,5*MINUTE,recent):unreadyReturn(invalidReason);
+    const fifteen=valid?rollingChange(s.samples,15*MINUTE,recent):unreadyReturn(invalidReason);
     const acceleration=valid?accelerationPattern(s.samples,recent):{ready:false,hit:false,returns:[]};
     const events=(s?.events || []).filter(e=>now-e.lastSeen<15*MINUTE);
     const fast=one.ready && atLeast(one.pct,1),strongFive=five.ready && atLeast(five.pct,2);
@@ -356,11 +384,12 @@ class SpikeEngine {
     const peakOne=valid?(s.oneReadings || []).filter(p=>p.observedAt>=now-MINUTE && p.observedAt<=now+10_000)
       .reduce((peak,p)=>!peak || p.pct>peak.pct || (p.pct===peak.pct && p.observedAt>peak.observedAt)?p:peak,null):null;
     const status=confirmed?"Confirmed active":verifying?"Spike detected · verifying":patterns.cooling?"Cooling":
-      !valid && s?"Data unavailable":!one.ready?"Warming up":above(one.pct,0)?"Rising in 1m":events.length?"Recent spike":"No active spike";
+      !one.ready?({warming:"Warming up",stale:"Quote stale",gap:"Interrupted coverage","missing-anchor":"Missing anchor",inconsistent:"Inconsistent quote",unavailable:"Price unavailable"}[one.reason] || "Data unavailable"):
+      above(one.pct,0)?"Rising in 1m":events.length?"Recent spike":"No active spike";
     return {events,one,five,fifteen,latestChange,peakOne:peakOne || unreadyReturn(),acceleration,patterns,active,confirmed,verifying,status,tier:confirmed?2:verifying?1:0,
       strength:one.ready?Math.max(0,one.pct):0,confirmation:s?.run || null,
       baselineEvents:(s?.baseline?.events || []).filter(e=>now-e.lastSeen<15*MINUTE),
-      coverage:{valid,lastQuoteAt:recent || null,since:s?.since || null,interruptions:s?.interruptions || 0,lastGap:s?.lastGap || null}};
+      coverage:{valid,reason:one.reason,oneReason:one.reason,lastQuoteAt:recent || null,since:s?.since || null,interruptions:s?.interruptions || 0,lastGap:s?.lastGap || null}};
   }
   snapshot() {return {day:this.day,states:this.states,source:PRICE_SOURCE,signalVersion:SIGNAL_VERSION};}
 }
@@ -374,7 +403,8 @@ function rankStocks(stocks,engine,now,context=null,baseline=false) {
     (baseline ? b.events.length-a.events.length || spikeStrength(b.events)-spikeStrength(a.events) || b.latest-a.latest :
       Number(!!b.view.one?.ready && Number.isFinite(b.view.one.pct))-Number(!!a.view.one?.ready && Number.isFinite(a.view.one.pct)) ||
       (a.view.one?.ready && Number.isFinite(a.view.one.pct) && b.view.one?.ready && Number.isFinite(b.view.one.pct) ? b.view.one.pct-a.view.one.pct : 0) ||
-      (b.view.coverage?.lastQuoteAt || b.stock.quoteAt || 0)-(a.view.coverage?.lastQuoteAt || a.stock.quoteAt || 0)) ||
+      (a.view.one?.ready && Number.isFinite(a.view.one.pct) && b.view.one?.ready && Number.isFinite(b.view.one.pct) ?
+        (b.view.coverage?.lastQuoteAt || b.stock.quoteAt || 0)-(a.view.coverage?.lastQuoteAt || a.stock.quoteAt || 0) : 0)) ||
     a.stock.rank-b.stock.rank).map(x=>x.stock);
 }
 function parseNextData(html) {
@@ -538,17 +568,18 @@ function optionStatus(snapshot, settings, time, market) {
 
 
 const FEED_URL = "https://groww.in/v1/api/stocks_fo_data/v1/live-aggregations/explore/market_trends/instrument/STOCKS?exchange=NSE&interval=FIFTEEN_MINUTES&limit=500&marketTrendFactor=PRICE&type=GAINERS";
-function cancelledRequest() {const error=new Error("Option request cancelled: stock no longer allowed");error.name="AbortError";return error;}
+function cancelledRequest(reason) {if(reason?.name==="TimeoutError")return reason;const error=new Error("Option request cancelled: stock no longer allowed");error.name="AbortError";return error;}
+function requestTimeout() {const error=new Error("Call request unavailable: 15-second request deadline exceeded; try again");error.name="TimeoutError";return error;}
 function requestAllowed(control) {
   try {return !control?.signal?.aborted && (!control?.allow || control.allow());} catch {return false;}
 }
-function requireAllowed(control) {if(!requestAllowed(control))throw cancelledRequest();}
+function requireAllowed(control) {if(!requestAllowed(control))throw cancelledRequest(control?.signal?.reason);}
 function awaitAllowed(promise,control) {
-  if(!requestAllowed(control)){Promise.resolve(promise).catch(()=>{});return Promise.reject(cancelledRequest());}
+  if(!requestAllowed(control)){Promise.resolve(promise).catch(()=>{});return Promise.reject(cancelledRequest(control?.signal?.reason));}
   const signal=control?.signal;
   if(!signal)return Promise.resolve(promise).then(value=>{requireAllowed(control);return value;});
   return new Promise((resolve,reject)=>{
-    const abort=()=>{signal.removeEventListener("abort",abort);reject(cancelledRequest());};
+    const abort=()=>{signal.removeEventListener("abort",abort);reject(cancelledRequest(signal.reason));};
     signal.addEventListener("abort",abort,{once:true});
     Promise.resolve(promise).then(value=>{signal.removeEventListener("abort",abort);try{requireAllowed(control);resolve(value);}catch(error){reject(error);}},error=>{signal.removeEventListener("abort",abort);reject(error);});
     if(signal.aborted)abort();
@@ -560,26 +591,40 @@ const FO_QUOTE_URL = "https://groww.in/v1/api/stocks_fo_data/v1/tr_live_prices/e
 function allowedRequest(url) {
   const u=new URL(url);
   if (u.protocol!=="https:" || u.username || u.password || u.port) return false;
+  const rawPath=String(url).match(/^https:\/\/[^/?#]+([^?#]*)/i)?.[1];
+  const publicCallQuote=rawPath===u.pathname && !u.search && !u.hash &&
+    /^\/v1\/api\/stocks_fo_data\/v1\/tr_live_(?:prices|book)\/exchange\/NSE\/segment\/FNO\/(?:[A-Z0-9&_.-]|%26)+CE\/latest$/.test(u.pathname);
   if (u.hostname==="groww.in") return u.pathname.startsWith("/v1/api/stocks_fo_data/v1/live-aggregations/explore/market_trends/") ||
     u.pathname==="/v1/api/stocks_data/equity_feature/v2/corporate_action/event" || u.pathname===new URL(QUOTE_URL).pathname || u.pathname===new URL(FO_QUOTE_URL).pathname ||
     /^\/v1\/api\/stocks_data\/v1\/tr_live_prices\/exchange\/NSE\/segment\/CASH\/[A-Z0-9&_.-]+\/latest$/.test(u.pathname) ||
-    /^\/v1\/api\/stocks_fo_data\/v1\/tr_live_(?:prices|book)\/exchange\/NSE\/segment\/FNO\/[A-Z0-9&_.-]+CE\/latest$/.test(u.pathname) || /^\/options\/[^/]+$/.test(u.pathname);
+    publicCallQuote || /^\/options\/[^/]+$/.test(u.pathname);
   return u.hostname==="www.nseindia.com" && u.pathname==="/api/holiday-master";
 }
 function retryDelay(headers, now) {
   const value=String(headers || "").match(/^retry-after:\s*(.+)$/im)?.[1]?.trim();
   if (!value) return 30_000;
-  const seconds=Number(value);
-  const ms=Number.isFinite(seconds) ? seconds*1000 : Date.parse(value)-now;
-  return Math.max(10_000,Math.min(300_000,Number.isFinite(ms)?ms:30_000));
+  const ms=/^\d+$/.test(value)?Number(value)*1000:Date.parse(value)-now;
+  // Retry-After is a server minimum, not a suggestion that can be capped locally.
+  return Math.max(10_000,Number.isFinite(ms)?ms:30_000);
 }
+function serviceFamily(url) {
+  const path=new URL(url).pathname;
+  if(url===QUOTE_URL)return "stock-quotes";
+  if(url===FO_QUOTE_URL)return "call-quotes";
+  if(path.includes("/tr_live_book/"))return "call-depth";
+  if(path.startsWith("/options/"))return "call-metadata";
+  if(path.includes("/market_trends/"))return "membership";
+  if(path.endsWith("/corporate_action/event"))return "results-calendar";
+  return path;
+}
+function notifyRequest(task,state,extra={}) {try{task.onState?.({state,url:task.url,...extra});}catch{}}
 class PublicTransport {
-  constructor(request,clock=()=>Date.now()) {this.request=request;this.clock=clock;this.queue=[];this.active=0;this.activeBackground=0;this.backoff=new Map();}
-  get(url,{priority=1,text=false,signal,allow}={}) {
+  constructor(request,clock=()=>Date.now()) {this.request=request;this.clock=clock;this.queue=[];this.active=0;this.activeCash=0;this.activeOther=0;this.backoff=new Map();}
+  get(url,{priority=1,text=false,signal,allow,onState,deadlineAt}={}) {
     if ([QUOTE_URL,FO_QUOTE_URL].includes(url)) return Promise.reject(new Error("Public quote batches require POST"));
-    return this.enqueue(url,{priority,text,method:"GET",signal,allow});
+    return this.enqueue(url,{priority,text,method:"GET",signal,allow,onState,deadlineAt});
   }
-  post(url,data,{priority=url===QUOTE_URL?0:2,signal,allow}={}) {
+  post(url,data,{priority=url===QUOTE_URL?0:2,signal,allow,onState,deadlineAt}={}) {
     if (![QUOTE_URL,FO_QUOTE_URL].includes(url)) return Promise.reject(new Error("Only public Groww quote batches accept POST"));
     const exactKeys=(value,keys)=>value && typeof value==="object" && !Array.isArray(value) && Object.keys(value).sort().join("|")===keys.slice().sort().join("|");
     const validList=(list,pattern)=>Array.isArray(list) && list.length>0 && list.length<=100 && new Set(list).size===list.length && list.every(s=>typeof s==="string" && s.length<=120 && pattern.test(s));
@@ -593,36 +638,59 @@ class PublicTransport {
         [map.NSE.indexSymbolList,map.BSE.priceSymbolList,map.BSE.indexSymbolList].every(list=>Array.isArray(list)&&list.length===0);
     }
     if (!valid) return Promise.reject(new Error("Invalid public quote batch"));
-    return this.enqueue(url,{priority,text:false,method:"POST",data:JSON.stringify(data),signal,allow});
+    return this.enqueue(url,{priority,text:false,method:"POST",data:JSON.stringify(data),signal,allow,onState,deadlineAt});
   }
-  enqueue(url,{priority,text,method,data,signal,allow}) {
+  cooldownState(url=QUOTE_URL) {
+    const host=new URL(url).hostname,now=this.clock();
+    const candidates=[this.backoff.get(`host:${host}`),this.backoff.get(`service:${host}:${serviceFamily(url)}`)].filter(value=>value?.retryAt>now);
+    const current=candidates.sort((a,b)=>b.retryAt-a.retryAt)[0];
+    return current?{paused:true,...current,remainingMs:current.retryAt-now}:{paused:false,retryAt:null,remainingMs:0,scope:null,status:null};
+  }
+  cooldownError(url) {
+    const cooldown=this.cooldownState(url),host=new URL(url).hostname;
+    if(!cooldown.paused)return null;
+    const error=new Error(`${host}: retry after ${Math.ceil(cooldown.remainingMs/1000)}s (${cooldown.scope} cooldown)`);
+    Object.assign(error,{name:"CooldownError",...cooldown});return error;
+  }
+  enqueue(url,{priority,text,method,data,signal,allow,onState,deadlineAt}) {
     if (!allowedRequest(url)) return Promise.reject(new Error("Request outside the public-data allowlist"));
-    if (!requestAllowed({signal,allow}))return Promise.reject(cancelledRequest());
+    if (!requestAllowed({signal,allow}))return Promise.reject(cancelledRequest(signal?.reason));
+    const cooldown=this.cooldownError(url);
+    if(cooldown){notifyRequest({url,onState},"cooldown",cooldown);return Promise.reject(cooldown);}
+    if(Number.isFinite(deadlineAt)&&deadlineAt<=this.clock())return Promise.reject(requestTimeout());
     return new Promise((resolve,reject)=>{
-      const task={url,priority,text,method,data,signal,allow,started:false,settled:false};
-      const finish=(callback,value)=>{if(task.settled)return;task.settled=true;signal?.removeEventListener("abort",task.cancel);callback(value);};
+      const task={url,priority,text,method,data,signal,allow,onState,deadlineAt,started:false,settled:false,cash:url===QUOTE_URL};
+      const finish=(callback,value)=>{if(task.settled)return;task.settled=true;clearTimeout(task.deadlineTimer);signal?.removeEventListener("abort",task.cancel);callback(value);};
       task.resolve=value=>finish(resolve,value);task.reject=error=>finish(reject,error);
       task.cancel=()=>{
         const index=this.queue.indexOf(task);if(index>=0)this.queue.splice(index,1);
         task.cancelRun?.();
         try {task.handle?.abort?.();} catch {}
-        task.reject(cancelledRequest());this.drain();
+        task.reject(cancelledRequest(signal?.reason));this.drain();
       };
       signal?.addEventListener("abort",task.cancel,{once:true});
+      if(Number.isFinite(deadlineAt))task.deadlineTimer=setTimeout(()=>{
+        const index=this.queue.indexOf(task);if(index>=0)this.queue.splice(index,1);
+        task.cancelRun?.(requestTimeout());try{task.handle?.abort?.();}catch{}
+        task.reject(requestTimeout());this.drain();
+      },Math.max(0,deadlineAt-this.clock()));
+      notifyRequest(task,"queued");
       this.queue.push(task);this.queue.sort((a,b)=>a.priority-b.priority);this.drain();
     });
   }
   drain() {
     while (this.active<2 && this.queue.length) {
-      const index=this.queue.findIndex(task=>task.priority<2 || this.activeBackground===0);
+      const index=this.queue.findIndex(task=>task.cash?this.activeCash===0:this.activeOther===0);
       if (index<0)break;
       const [task]=this.queue.splice(index,1), host=new URL(task.url).hostname;
-      if (!requestAllowed(task)) {task.reject(cancelledRequest());continue;}
-      const retryAt=this.backoff.get(host) || 0;
-      if (retryAt>this.clock()) {task.reject(new Error(`${host}: retry after ${Math.ceil((retryAt-this.clock())/1000)}s`));continue;}
+      if (!requestAllowed(task)) {task.reject(cancelledRequest(task.signal?.reason));continue;}
+      const cooldown=this.cooldownError(task.url);
+      if(cooldown){notifyRequest(task,"cooldown",cooldown);task.reject(cooldown);continue;}
+      if(Number.isFinite(task.deadlineAt)&&task.deadlineAt<=this.clock()){task.reject(requestTimeout());continue;}
       task.started=true;this.active++;
-      if (task.priority>=2)this.activeBackground++;
-      this.run(task,host).then(task.resolve,task.reject).finally(()=>{this.active--;if(task.priority>=2)this.activeBackground--;this.drain();});
+      if(task.cash)this.activeCash++;else this.activeOther++;
+      notifyRequest(task,"requesting");
+      this.run(task,host).then(task.resolve,task.reject).finally(()=>{this.active--;if(task.cash)this.activeCash--;else this.activeOther--;this.drain();});
     }
   }
   run(task,host) {
@@ -630,7 +698,7 @@ class PublicTransport {
       let finished=false;
       const finish=(callback,value)=>{if(finished)return;finished=true;task.cancelRun=null;callback(value);};
       const fail=()=>finish(reject,new Error(`${host}: request failed or blocked; retry later`));
-      task.cancelRun=()=>finish(reject,cancelledRequest());
+      task.cancelRun=reason=>finish(reject,reason?.name==="TimeoutError"?reason:cancelledRequest(task.signal?.reason));
       if (!requestAllowed(task)) {task.cancelRun();return;}
       try {task.handle=this.request({method:task.method,url:task.url,data:task.data,anonymous:true,timeout:12_000,
         headers:{Accept:task.text?"text/html":"application/json",...(task.method==="POST"?{"Content-Type":"application/json"}:{})},
@@ -640,7 +708,10 @@ class PublicTransport {
           if (!requestAllowed(task)) {task.cancelRun();return;}
           if (r.finalUrl && !allowedRequest(r.finalUrl)) {finish(reject,new Error(`${host}: unexpected redirect`));return;}
           if ([429,503].includes(r.status)) {
-            this.backoff.set(host,this.clock()+retryDelay(r.responseHeaders,this.clock()));
+            const scope=r.status===429?"host":"service",family=serviceFamily(task.url),key=scope==="host"?`host:${host}`:`service:${host}:${family}`;
+            const retryAt=Math.max(this.backoff.get(key)?.retryAt || 0,this.clock()+retryDelay(r.responseHeaders,this.clock()));
+            this.backoff.set(key,{retryAt,scope,status:r.status,family});
+            notifyRequest(task,"cooldown",this.cooldownState(task.url));
             finish(reject,new Error(`${host}: temporarily unavailable (${r.status}); backing off`));return;
           }
           if (r.status<200 || r.status>=300) {finish(reject,new Error(`${host}: public data unavailable (${r.status})`));return;}
@@ -652,7 +723,7 @@ class PublicTransport {
 }
 
 class Providers {
-  constructor(transport,storage,clock=()=>Date.now()) {this.transport=transport;this.storage=storage;this.clock=clock;this.memo=new Map();this.holidayData=null;this.optionTasks=new Map();this.optionMemoKeys=new Map();this.lastMembership=null;}
+  constructor(transport,storage,clock=()=>Date.now()) {this.transport=transport;this.storage=storage;this.clock=clock;this.memo=new Map();this.holidayData=null;this.optionTasks=new Map();this.optionMemoKeys=new Map();this.lastMembership=null;this.membershipFetchedAt=0;this.membershipAttemptAt=0;this.membershipError=null;this.membershipPending=null;}
   async cached(key,ttl,load,force=false) {
     const old=this.memo.get(key);
     if (old && !force && (old.promise || this.clock()-old.time<ttl)) return old.promise || old.value;
@@ -673,10 +744,29 @@ class Providers {
     const bySymbol=new Map(values.flat().map(stock=>[stock.symbol,stock]));
     return stocks.map(stock=>bySymbol.get(stock.symbol));
   }
+  async membership(force=false) {
+    if(this.membershipPending)return this.membershipPending;
+    const snapshot=()=>({stocks:this.lastMembership || [],membershipFetchedAt:this.membershipFetchedAt,membershipError:this.membershipError,
+      stale:!!this.membershipError,ageMs:this.membershipFetchedAt?Math.max(0,this.clock()-this.membershipFetchedAt):null});
+    if(!force && this.lastMembership && this.clock()-this.membershipAttemptAt<60_000)return snapshot();
+    this.membershipAttemptAt=this.clock();
+    const load=async()=>{
+      try {
+        const candidates=normalizeMovers(await this.transport.get(FEED_URL,{priority:1}));
+        this.lastMembership=candidates;this.membershipFetchedAt=this.clock();this.membershipError=null;
+        return snapshot();
+      } catch(error) {
+        this.membershipError=error.message;
+        if(this.lastMembership)return snapshot();
+        throw error;
+      }
+    };
+    const pending=load();this.membershipPending=pending;
+    try{return await pending;}finally{if(this.membershipPending===pending)this.membershipPending=null;}
+  }
   async movers(allow=()=>true) {
-    const candidates=await this.cached("candidate-list",60_000,async()=>normalizeMovers(await this.transport.get(FEED_URL,{priority:0})));
-    this.lastMembership=candidates;
-    return (await this.quotes(candidates.filter(allow))).filter(allow);
+    const {stocks}=await this.membership();
+    return (await this.quotes(stocks.filter(allow))).filter(allow);
   }
   async holidays() {
     const now=this.clock();
@@ -707,10 +797,13 @@ class Providers {
   async options(stock,requestedExpiry=null,force=false,limit=3,settings=DEFAULTS,priority=2,guard=()=>true) {
     if (!stock.searchId || !stock.symbol) throw new Error("Stock contract identifiers unavailable");
     const external=typeof guard==="function"?{allow:guard}:guard||{},controller=new AbortController();
-    const externalAbort=()=>controller.abort();
+    const externalAbort=()=>controller.abort(external.signal?.reason);
     external.signal?.addEventListener("abort",externalAbort,{once:true});
-    if(external.signal?.aborted)controller.abort();
-    const control={signal:controller.signal,allow:external.allow},tasks=this.optionTasks.get(stock.symbol)||new Set();
+    if(external.signal?.aborted)controller.abort(external.signal.reason);
+    const timeoutMs=Number.isFinite(external.deadlineMs)&&external.deadlineMs>0?external.deadlineMs:priority===1?15_000:null;
+    const deadlineAt=timeoutMs===null?undefined:this.clock()+timeoutMs;
+    const deadlineTimer=timeoutMs===null?null:setTimeout(()=>controller.abort(requestTimeout()),timeoutMs);
+    const control={signal:controller.signal,allow:external.allow,onState:external.onState,deadlineAt},tasks=this.optionTasks.get(stock.symbol)||new Set();
     tasks.add(controller);this.optionTasks.set(stock.symbol,tasks);
     const stage=promise=>awaitAllowed(promise,control);
     const cached=async(key,ttl,load)=>{
@@ -735,24 +828,37 @@ class Providers {
       if (meta.expiry!==expiry) meta=await loadMeta(expiry);
       if (meta.expiry!==expiry) throw new Error("Groww did not return metadata for the selected expiry");
       const depthLimit=Math.max(1,Math.min(100,Number.isFinite(Number(limit))?Math.floor(Number(limit)):3));
+      const current=external.stockQuote || stock;
+      const reusable=current?.symbol===stock.symbol && current.priceSource===PRICE_SOURCE && !current.priceError && current.spot>0 && current.previousClose>0 &&
+        Number.isFinite(current.dayPct) && Math.abs((current.spot/current.previousClose-1)*100-current.dayPct)<=0.000001 && quoteFresh(current,this.clock());
+      const stockQuote=reusable?current:await cached(`option-spot:${stock.symbol}`,10_000,async()=>(await this.quotes([stock],priority,control))[0]);
+      requireAllowed(control);
+      const initial=normalizeGrowwOptions(meta,stockQuote,{}, {},this.clock());
+      const requested=callsInRange(initial.items,settings).slice(0,depthLimit);
+      const contracts=requested.map(item=>item.contract).filter(Boolean);
       const key=`groww-options:${stock.symbol}:${expiry}:${depthLimit}:${settings.minDistance}:${settings.nearTarget}`;
+      const oldResult=this.memo.get(key);
+      if(oldResult?.value && (oldResult.value.spotQuoteAt!==stockQuote.quoteAt || oldResult.value.spot!==stockQuote.spot))this.memo.delete(key);
       const result=await cached(key,10_000,async()=>{
         requireAllowed(control);
-        const contracts=Object.values(meta.contracts).map(item=>item.contract).filter(Boolean);
-        const [stockQuote,prices]=await stage(Promise.all([
-          cached(`option-spot:${stock.symbol}`,10_000,async()=>(await this.quotes([stock],priority,control))[0]),
-          cached(`option-prices:${stock.symbol}:${expiry}`,10_000,async()=>{
-            const batches=[];
-            for (let i=0;i<contracts.length;i+=100) batches.push(contracts.slice(i,i+100));
-            if (!batches.length) throw new Error("Groww call contracts unavailable");
-            const parts=await stage(Promise.all(batches.map(ids=>{requireAllowed(control);return this.transport.post(FO_QUOTE_URL,ids,{priority,...control});})));
-            for (const part of parts) if (!part || typeof part!=="object" || Array.isArray(part)) throw new Error("Groww option quote batch unavailable");
-            return Object.assign({},...parts);
-          }),
-        ]));
+        const prices={},missing=[];
+        for(const contract of contracts){
+          const tradeKey=`option-trade:${contract}`,old=this.memo.get(tradeKey);
+          const keys=this.optionMemoKeys.get(stock.symbol)||new Set();keys.add(tradeKey);this.optionMemoKeys.set(stock.symbol,keys);
+          if(!force && old && !old.promise && this.clock()-old.time<10_000)Object.assign(prices,old.value);
+          else missing.push(contract);
+        }
+        for(let index=0;index<missing.length;index+=100){
+          requireAllowed(control);
+          const ids=missing.slice(index,index+100),part=await stage(this.transport.post(FO_QUOTE_URL,ids,{priority,...control}));
+          if(!part || typeof part!=="object" || Array.isArray(part))throw new Error("Groww option quote batch unavailable");
+          const expected=new Set(ids);
+          if(Object.keys(part).some(contract=>!expected.has(contract)))throw new Error("Groww returned an unrequested call contract");
+          // Validate contract identities and source times before anything enters the cache.
+          normalizeGrowwOptions(meta,stockQuote,part,{},this.clock());requireAllowed(control);
+          for(const contract of ids){const value=Object.hasOwn(part,contract)?{[contract]:part[contract]}:{};Object.assign(prices,value);this.memo.set(`option-trade:${contract}`,{time:this.clock(),value});}
+        }
         requireAllowed(control);
-        const initial=normalizeGrowwOptions(meta,stockQuote,prices,{},this.clock());
-        const requested=callsInRange(initial.items,settings).slice(0,depthLimit);
         const books=await stage(Promise.all(requested.map(async item=>{
           requireAllowed(control);
           try {
@@ -763,8 +869,9 @@ class Providers {
         requireAllowed(control);
         return {...normalizeGrowwOptions(meta,stockQuote,prices,Object.fromEntries(books),this.clock()),expiries,loadedLimit:depthLimit};
       });
-      requireAllowed(control);return result;
+      requireAllowed(control);return {...result,stockQuote};
     } finally {
+      clearTimeout(deadlineTimer);
       external.signal?.removeEventListener("abort",externalAbort);tasks.delete(controller);
       if(!tasks.size&&this.optionTasks.get(stock.symbol)===tasks)this.optionTasks.delete(stock.symbol);
     }
@@ -774,10 +881,12 @@ class Providers {
 
 const ARCHIVE_LIMITS=Object.freeze({sessions:20,bytes:50*1024*1024});
 const LEGACY_OBSERVATION_COLUMNS=["symbol","gsin","growwRank","price","previousClose","sourceAt","volume","status","onePct","fivePct","fifteenPct","rank","baselineRank","exclusions","interruptions","oneSeconds","fiveSeconds","fifteenSeconds"];
-const OBSERVATION_COLUMNS=[...LEGACY_OBSERVATION_COLUMNS,"sampleChangePct","sampleSeconds","sampleAt","recentPeakOnePct","recentPeakOneAt","dayPct","confirmationState"];
+const V3_OBSERVATION_COLUMNS=[...LEGACY_OBSERVATION_COLUMNS,"sampleChangePct","sampleSeconds","sampleAt","recentPeakOnePct","recentPeakOneAt","dayPct","confirmationState"];
+const OBSERVATION_COLUMNS=[...V3_OBSERVATION_COLUMNS,"oneAnchorOffsetSeconds","oneCoverageReason"];
 const SIGNAL_DEFINITIONS=Object.freeze({
   2:"One-minute or five-minute strong bursts; confirmed-active and trigger strength ranking.",
-  3:"Current one-minute return ranking; only one-minute rises of at least 1% create strong bursts. Five-minute returns are context only."
+  3:"Current one-minute return ranking; only one-minute rises of at least 1% create strong bursts. Five-minute returns are context only.",
+  4:"Current one-minute return ranking using the closest real sample within 10 seconds of the boundary, older on ties, after 60 seconds of history. Only one-minute rises of at least 1% create strong bursts; five-minute returns are context only."
 });
 function diagnosticFrame(stocks,engine,at,context,transitions=[],extra={}) {
   // Results exclusion applies before any current membership, rank, or transition is archived.
@@ -785,13 +894,13 @@ function diagnosticFrame(stocks,engine,at,context,transitions=[],extra={}) {
   const allowed=stocks.filter(s=>resultsCheck(s,context.calendar,context.window,at).pass),symbols=new Set(allowed.map(s=>s.symbol));
   const ranks=new Map(rankStocks(allowed,engine,at,context).map((s,i)=>[s.symbol,i+1]));
   const baseline=new Map(rankStocks(allowed,engine,at,context,true).map((s,i)=>[s.symbol,i+1]));
-  return {...extra,schema:2,day:istDay(at),at,signalVersion:SIGNAL_VERSION,thresholds:{one:1,fiveContextOnly:true},
+  return {...extra,schema:3,day:istDay(at),at,signalVersion:SIGNAL_VERSION,thresholds:{one:1,fiveContextOnly:true,oneAnchor:"closest-real-sample-10s-older-tie"},
     observations:allowed.map(s=>{
       const v=engine.view(s,at),check=stockCheck(s,context.calendar,context.window,at,context.settings || DEFAULTS);
       return [s.symbol,s.gsin,s.rank,s.spot,s.previousClose,s.quoteAt,s.volume,v.status,v.one.pct,v.five.pct,v.fifteen.pct,
         ranks.get(s.symbol),baseline.get(s.symbol),check.reasons,v.coverage.interruptions,v.one.seconds ?? null,v.five.seconds ?? null,v.fifteen.seconds ?? null,
         v.latestChange?.pct ?? null,v.latestChange?.seconds ?? null,v.latestChange?.endAt ?? null,v.peakOne?.pct ?? null,v.peakOne?.observedAt ?? null,s.dayPct ?? null,
-        v.confirmed?"confirmed":v.verifying?"verifying":"none"];
+        v.confirmed?"confirmed":v.verifying?"verifying":"none",v.one.anchorOffsetSeconds ?? null,v.one.reason ?? v.coverage.reason ?? null];
     }),transitions:transitions.filter(t=>symbols.has(t.symbol))};
 }
 function mean(values) {return values.length?values.reduce((a,b)=>a+b,0)/values.length:null;}
@@ -865,8 +974,8 @@ class SignalDiagnosticReview {
         meanReturnPct:mean(this.outcomes[m].map(p=>p.returnPct)),observations:this.outcomes[m]}]))};
   }
 }
-// Definitions changed at version 3. Never mix old five-minute-created events with the
-// one-minute-only confirmation rate or forward paths, even in a shared session/archive.
+// Definitions changed at versions 3 and 4. Never mix trigger or anchor definitions
+// in confirmation rates or forward paths, even in a shared session/archive.
 class DiagnosticReview {
   constructor() {this.versions=new Map();this.sessions=new Set();this.frames=0;}
   consume(frame) {
@@ -953,17 +1062,18 @@ class DiagnosticArchive {
       for(const line of text.trim().split("\n"))if(line) {const frame=JSON.parse(line);review.consume(frame);parts.push(line+"\n");}
     }
     const report=review.report();
-    const header={type:"groww-strategy-diagnostics",schema:2,signalVersion:SIGNAL_VERSION,exportedAt:Date.now(),columns:OBSERVATION_COLUMNS,
-      columnsBySchema:{1:LEGACY_OBSERVATION_COLUMNS,2:OBSERVATION_COLUMNS},signalDefinitions:SIGNAL_DEFINITIONS,limits:ARCHIVE_LIMITS,
+    const header={type:"groww-strategy-diagnostics",schema:3,signalVersion:SIGNAL_VERSION,exportedAt:Date.now(),columns:OBSERVATION_COLUMNS,
+      columnsBySchema:{1:LEGACY_OBSERVATION_COLUMNS,2:V3_OBSERVATION_COLUMNS,3:OBSERVATION_COLUMNS},signalDefinitions:SIGNAL_DEFINITIONS,limits:ARCHIVE_LIMITS,
       thresholds:SPIKE_THRESHOLDS,report,archiveError:this.error,notes:"Public observations only. Coverage is limited to the visible monitored list. Historical peaks and outcomes are not trade profits."};
     return {blob:new Blob([JSON.stringify(header)+"\n",...parts],{type:"application/x-ndjson"}),report};
   }
 }
 
 // The installed bundle contains this controller, the pure core and public providers.
-const STYLE = ":host{display:block;color:#edf3f1;font:14px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Arial,sans-serif;color-scheme:dark;margin:20px 0 32px;--green:#31d3a3;--muted:#8d9e98;--line:#2a3731;--bg:#111915}*{box-sizing:border-box}button,input,select{font:inherit}button,a,input,select{outline-offset:4px}button{cursor:pointer}button:disabled{cursor:default;opacity:.5}button,a{touch-action:manipulation}a{color:var(--green);text-decoration:none}a:hover{text-decoration:underline}.bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap}.identity{display:flex;align-items:center;gap:10px}.mark{display:grid;place-items:center;background:#133c2f;color:var(--green);width:36px;height:36px;border-radius:10px;font-size:20px;font-weight:700}.brand{font-size:15px;font-weight:650}.small{font-size:12px;color:var(--muted)}.toggle{display:flex;padding:4px;background:#19241f;border:1px solid var(--line);border-radius:12px}.toggle button{border:0;background:transparent;color:var(--muted);padding:8px 18px;border-radius:8px}.toggle button[aria-pressed=true]{background:#d7f8eb;color:#102b20;font-weight:650}.panel{border:1px solid var(--line);border-radius:16px;background:var(--bg);overflow:hidden}.intro{padding:24px 26px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}h2{font-size:23px;line-height:1.3;margin:0 0 6px;font-weight:650;letter-spacing:-.5px}p{margin:0}.status{display:flex;gap:8px;align-items:center;color:#b7c7bf;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#a4afa9}.dot.live{background:var(--green);box-shadow:0 0 0 4px #29d39a16}.stats{display:flex;gap:0;flex-wrap:wrap;padding:18px 26px;border-bottom:1px solid var(--line)}.stat{min-width:160px;padding-right:35px}.stat strong{font-size:25px;line-height:1.3;display:block;letter-spacing:-.8px;font-weight:600}.stat span{color:var(--muted);font-size:12px}.toolbar{padding:14px 26px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;border-bottom:1px solid var(--line)}.toolbar-group{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #37473e;border-radius:8px;padding:7px 12px;background:#1b2921;color:#e8f0eb}.btn:hover{background:#273c2f}.btn.primary{background:#173d2e;color:#72e7bd;border-color:#2d6850}.check{display:flex;align-items:center;gap:7px;cursor:pointer;white-space:nowrap}input[type=checkbox]{accent-color:var(--green);width:15px;height:15px}.pill{display:inline-flex;gap:5px;align-items:center;border:1px solid var(--line);padding:3px 7px;border-radius:6px;font-size:11px;white-space:nowrap;color:#aabbb1;background:#1b2720}.pill.green{color:#73e6b6;background:#123629;border-color:#235b42}.pill.red{color:#ffaaa2;background:#3b2421;border-color:#6a3833}.pill.amber{color:#edcb8d;background:#352e20;border-color:#5c4b2d}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;table-layout:auto}th{font-weight:500;color:var(--muted);font-size:12px;padding:12px 18px;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:17px 18px;border-bottom:1px solid #243029;vertical-align:top}tbody tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.stock-cell{min-width:180px}.stock-name{font-weight:600;font-size:14px;color:#eef4f0}.stock-meta{font-size:11px;color:var(--muted);margin-top:3px}.rank{color:#71887a;margin-right:7px}.price{font-size:14px;font-weight:500}.positive{color:#54d8a6}.negative{color:#f19489}.spikes{min-width:230px;max-width:350px}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:5px}.spike-tag{border-radius:6px;background:#12392a;color:#6fe2ae;border:1px solid #266043;font-size:11px;padding:4px 6px;display:inline-block}.spike-tag time{color:#8cb6a0;margin-left:4px}.reason{margin:0 0 5px}.candidate{background:#15322555}.candidate .stock-name{color:#83edbd}.empty{padding:38px 22px;text-align:center;color:#a5b4ac}.empty strong{color:#edf3f1;display:block;margin-bottom:6px}.note{padding:13px 26px;color:#94a79a;font-size:12px;background:#142019}.notice{padding:12px 26px;background:#342b1e;color:#e8c58a;border-bottom:1px solid #5a492c;font-size:12px}.notice.error{background:#352420;color:#efb1a7}.options-cell{padding:0!important}.options{padding:22px 26px;background:#18251d;border-top:1px solid #35513e}.options-header{display:flex;gap:18px;justify-content:space-between;align-items:center;flex-wrap:wrap;margin-bottom:14px}.options h3{font-size:17px;margin:0 0 3px}.options table{font-size:12px;min-width:900px}.options td,.options th{padding:9px 10px;border-color:#344336}.options select{padding:7px;background:#111e16;color:#ecf3ee;border:1px solid #435547;border-radius:6px}.fail-reason{font-size:11px;color:#c8ab85;max-width:220px;white-space:normal}.settings{padding:20px 26px;border-bottom:1px solid var(--line);background:#18251e}.settings-grid{display:flex;gap:14px;flex-wrap:wrap;align-items:end}.settings label{display:block;font-size:12px;color:#b8c6bc}.settings input{display:block;width:125px;border:1px solid #435549;border-radius:6px;background:#0e1912;color:white;margin-top:4px;padding:7px}.footer{padding:14px 26px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;color:#839b8b;font-size:11px;border-top:1px solid var(--line)}details summary{cursor:pointer;color:#a6b9ac}.spinner{color:#c5d5cb;font-size:12px}.help{max-width:760px;white-space:normal;line-height:1.8}.inactive{font-size:12px;color:#95a89c;padding:10px 0}.options .num{white-space:nowrap}.loading{padding:32px 26px;color:#b6c7bb}.loading:before{content:\"\";display:inline-block;width:12px;height:12px;border:2px solid #4b7860;border-top-color:#95e4b6;border-radius:50%;margin-right:10px;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.loading:before{animation:none}}@media(max-width:760px){.intro,.toolbar,.stats,.footer,.note,.notice,.settings{padding-left:16px;padding-right:16px}.stat{min-width:105px;padding-right:15px}.stat strong{font-size:21px}.spikes{min-width:190px}th,td{padding:12px}h2{font-size:20px}.bar{gap:10px}.options{padding:16px}} \n\n.explain-tag{text-align:left;line-height:1.5}.explain-tag:hover{filter:brightness(1.2);text-decoration:underline;text-underline-offset:3px}.explain-tag:focus-visible{outline:2px solid #a0edcd}.direct-options{display:block;font-size:11px;margin-top:8px;white-space:nowrap}.tag-dialog{width:min(620px,calc(100vw - 32px));max-height:calc(100vh - 48px);overflow:auto;border:1px solid #456552;border-radius:16px;background:#15241b;color:#e5f0e8;padding:24px;box-shadow:0 24px 90px #0009;font:14px/1.65 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Arial,sans-serif}.tag-dialog::backdrop{background:#000a;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}.dialog-head h2{font-size:20px;margin:0}.tag-dialog p{margin:12px 0}.tag-dialog dl{margin:18px 0;border-top:1px solid #344a3c}.tag-dialog dl>div{display:flex;justify-content:space-between;gap:24px;padding:8px 0;border-bottom:1px solid #344a3c}.tag-dialog dt{color:#9fb6a6}.tag-dialog dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}.tag-dialog .btn{flex:none}\n\n.stock-row{cursor:pointer;outline-offset:-2px}.stock-row:focus-visible{outline:2px solid #a0edcd}.stock-row:hover{background:#1c302380}.stock-row.selected{box-shadow:inset 3px 0 #6be4b4;background:#1c362880}.stock-open{border:0;background:none;padding:0;text-align:left;line-height:1.5}.stock-open:hover{text-decoration:underline;text-underline-offset:3px}.calls-cell{min-width:132px}.calls-cell .btn{white-space:nowrap}.calls-drawer{position:fixed;z-index:2147483000;top:12px;right:12px;bottom:12px;width:min(510px,calc(100vw - 24px));display:flex;flex-direction:column;background:#101c15;border:1px solid #486d55;border-radius:16px;box-shadow:-14px 0 70px #0009;outline:none}.calls-head{padding:18px 20px 14px;display:flex;gap:16px;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--line);flex:none}.calls-head h2{font-size:20px;letter-spacing:-.3px;margin-bottom:5px}.calls-head .btn{padding:4px 9px;flex:none}.calls-body{overflow:auto;overscroll-behavior:contain;flex:1;padding:16px 20px;scrollbar-gutter:stable}.call-controls{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.call-controls select{background:#182c20;border:1px solid #3a5944;border-radius:6px;padding:6px;color:#f1f5f2;margin-left:5px}.call-source{font-size:11px;line-height:1.8;color:#91aa99;margin-bottom:9px}.call-source strong{color:#d9e8de;font-weight:500}.call-state{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:9px 0 14px}.call-state .small{font-size:11px}.snapshot-notice{background:#352f20;border:1px solid #5c4b2e;color:#e2c68e;padding:8px 10px;border-radius:7px;font-size:12px;margin:0 0 12px}.call-cards{display:grid;gap:12px}.call-card{padding:14px;background:#17271c;border:1px solid #344b39;border-radius:12px}.call-card.call-live{border-color:#2c6749}.call-card-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.call-card h3{display:flex;align-items:center;gap:9px;margin:0;font-size:16px;font-weight:600}.call-index{display:inline-grid;place-items:center;width:23px;height:23px;border-radius:6px;background:#2b4332;color:#a1c9af;font-size:12px;font-weight:500}.distance{font-size:12px;color:#a2c8b2;white-space:nowrap}.call-money{display:grid;grid-template-columns:1fr 1.3fr;gap:8px}.call-money>div{display:flex;flex-direction:column}.call-money strong{font-size:23px;font-weight:600;line-height:1.4;letter-spacing:-.6px;font-variant-numeric:tabular-nums}.call-money .small{font-size:11px}.profit-block{text-align:right}.ltp-reference{margin:7px 0;color:#9bad9e;font-size:11px}.call-bottom{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.call-bottom .small{font-size:11px}.call-bottom strong{color:#c0d5c7;font-weight:500}.call-depth{margin-top:9px;border-top:1px solid #2f4736;padding-top:7px;font-size:11px}.call-depth summary{color:#a0b5a8}.call-depth dl{margin:8px 0 0}.call-depth dl>div{display:flex;gap:16px;justify-content:space-between;padding:5px 0;border-bottom:1px solid #2b3e30}.call-depth dt{color:#819e8a}.call-depth dd{margin:0;text-align:right;color:#c4d6ca;font-variant-numeric:tabular-nums}.failed-checks{margin-top:8px;color:#d5b67d}.calls-foot{padding:12px 20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;flex:none}.chain-link{font-size:12px;font-weight:500}.calls-foot .small{font-size:10px}.more-calls{width:100%;margin-top:14px}.call-count{margin-top:10px;font-size:11px}.payoff-note{font-size:11px;color:#92a898;line-height:1.7;margin:15px 0 0}.calls-body .notice{padding:12px;border:1px solid #66422f;border-radius:8px}.calls-body .empty{padding:25px 8px}.calls-body .loading{padding:25px 0}@media(max-width:560px){.calls-drawer{top:6px;right:6px;bottom:6px;width:calc(100vw - 12px);border-radius:12px}.calls-head{padding:14px}.calls-body{padding:12px 14px}.calls-foot{padding:10px 14px}.call-money strong{font-size:22px}.call-card{padding:12px}.call-state .small{max-width:100%}}\n\n.calls-head{padding:14px 18px 11px}.calls-head h2{font-size:19px}.calls-head .small{font-size:11px}.calls-body{padding:12px 18px}.call-controls{margin-bottom:8px}.call-controls .btn{padding:5px 10px}.call-controls select{padding:5px}.call-source{line-height:1.6;margin-bottom:6px}.call-state{margin:6px 0 11px}.call-cards{gap:10px}.call-card{padding:11px 12px}.call-card-head{margin-bottom:5px}.call-money strong{font-size:22px;line-height:1.25}.ltp-reference{margin:5px 0;font-size:10px}.call-card-status{float:right;margin-top:4px}.call-depth{margin-top:5px;padding-top:4px}.call-depth summary{line-height:24px;font-size:11px}.call-depth dl{clear:both}.call-card .pill{font-size:10px;padding:2px 6px}.call-count{margin-top:8px}.payoff-note{margin-top:12px}.calls-foot{padding:10px 18px}\n\n.calls-cell .btn{display:inline-flex;white-space:nowrap}.source-checks{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:6px 0}.source-checks .small{font-size:10px}.failed-checks{font-size:11px;line-height:1.5;margin:6px 0;color:#e3c087}.range-exception{margin:3px 0 7px}.call-depth dd{overflow-wrap:anywhere;max-width:64%}.settings label.near-setting{display:flex;align-items:center;gap:8px;margin-top:14px}.settings .near-setting input{display:inline-block;width:15px;height:15px;margin:0}.near-setting input{accent-color:var(--green)}\n\n.coverage-line{padding:10px 26px;border-bottom:1px solid var(--line);line-height:1.6}.current-returns{max-width:300px;font-variant-numeric:tabular-nums;line-height:1.7}.pattern-tags{margin-top:6px}.pattern-details{margin-top:5px;color:#9bac9f;font-size:11px}.pattern-details>summary{cursor:pointer;line-height:1.7}.pattern-details>.tags{margin-top:7px}.pattern-details .spike-tag{font-size:10px}.burst-count{font-size:11px}.spikes{min-width:280px}.spikes .pill{white-space:normal;text-align:left}\n\n.export-ready{padding:12px 26px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line)}\n.rise-value{display:block;border:0;background:transparent;color:#c6d6cd;padding:0;margin:0 0 2px;text-align:left;font-size:22px;line-height:1.35;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.5px}.rise-value.positive{color:#54d8a6}.rise-value:hover{text-decoration:underline;text-underline-offset:3px}.spikes>.tags{margin-top:7px}.sample-context{font-size:10px;line-height:1.7}.stats .stat{padding-bottom:5px}\n";
+const STYLE = ":host{display:block;color:#edf3f1;font:14px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Arial,sans-serif;color-scheme:dark;margin:20px 0 32px;--green:#31d3a3;--muted:#8d9e98;--line:#2a3731;--bg:#111915}*{box-sizing:border-box}button,input,select{font:inherit}button,a,input,select{outline-offset:4px}button{cursor:pointer}button:disabled{cursor:default;opacity:.5}button,a{touch-action:manipulation}a{color:var(--green);text-decoration:none}a:hover{text-decoration:underline}.bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap}.identity{display:flex;align-items:center;gap:10px}.mark{display:grid;place-items:center;background:#133c2f;color:var(--green);width:36px;height:36px;border-radius:10px;font-size:20px;font-weight:700}.brand{font-size:15px;font-weight:650}.small{font-size:12px;color:var(--muted)}.toggle{display:flex;padding:4px;background:#19241f;border:1px solid var(--line);border-radius:12px}.toggle button{border:0;background:transparent;color:var(--muted);padding:8px 18px;border-radius:8px}.toggle button[aria-pressed=true]{background:#d7f8eb;color:#102b20;font-weight:650}.panel{border:1px solid var(--line);border-radius:16px;background:var(--bg);overflow:hidden}.intro{padding:24px 26px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}h2{font-size:23px;line-height:1.3;margin:0 0 6px;font-weight:650;letter-spacing:-.5px}p{margin:0}.status{display:flex;gap:8px;align-items:center;color:#b7c7bf;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#a4afa9}.dot.live{background:var(--green);box-shadow:0 0 0 4px #29d39a16}.stats{display:flex;gap:0;flex-wrap:wrap;padding:18px 26px;border-bottom:1px solid var(--line)}.stat{min-width:160px;padding-right:35px}.stat strong{font-size:25px;line-height:1.3;display:block;letter-spacing:-.8px;font-weight:600}.stat span{color:var(--muted);font-size:12px}.toolbar{padding:14px 26px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;border-bottom:1px solid var(--line)}.toolbar-group{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #37473e;border-radius:8px;padding:7px 12px;background:#1b2921;color:#e8f0eb}.btn:hover{background:#273c2f}.btn.primary{background:#173d2e;color:#72e7bd;border-color:#2d6850}.check{display:flex;align-items:center;gap:7px;cursor:pointer;white-space:nowrap}input[type=checkbox]{accent-color:var(--green);width:15px;height:15px}.pill{display:inline-flex;gap:5px;align-items:center;border:1px solid var(--line);padding:3px 7px;border-radius:6px;font-size:11px;white-space:nowrap;color:#aabbb1;background:#1b2720}.pill.green{color:#73e6b6;background:#123629;border-color:#235b42}.pill.red{color:#ffaaa2;background:#3b2421;border-color:#6a3833}.pill.amber{color:#edcb8d;background:#352e20;border-color:#5c4b2d}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;table-layout:auto}th{font-weight:500;color:var(--muted);font-size:12px;padding:12px 18px;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:17px 18px;border-bottom:1px solid #243029;vertical-align:top}tbody tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.stock-cell{min-width:180px}.stock-name{font-weight:600;font-size:14px;color:#eef4f0}.stock-meta{font-size:11px;color:var(--muted);margin-top:3px}.rank{color:#71887a;margin-right:7px}.price{font-size:14px;font-weight:500}.positive{color:#54d8a6}.negative{color:#f19489}.spikes{min-width:230px;max-width:350px}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:5px}.spike-tag{border-radius:6px;background:#12392a;color:#6fe2ae;border:1px solid #266043;font-size:11px;padding:4px 6px;display:inline-block}.spike-tag time{color:#8cb6a0;margin-left:4px}.reason{margin:0 0 5px}.candidate{background:#15322555}.candidate .stock-name{color:#83edbd}.empty{padding:38px 22px;text-align:center;color:#a5b4ac}.empty strong{color:#edf3f1;display:block;margin-bottom:6px}.note{padding:13px 26px;color:#94a79a;font-size:12px;background:#142019}.notice{padding:12px 26px;background:#342b1e;color:#e8c58a;border-bottom:1px solid #5a492c;font-size:12px}.notice.error{background:#352420;color:#efb1a7}.options-cell{padding:0!important}.options{padding:22px 26px;background:#18251d;border-top:1px solid #35513e}.options-header{display:flex;gap:18px;justify-content:space-between;align-items:center;flex-wrap:wrap;margin-bottom:14px}.options h3{font-size:17px;margin:0 0 3px}.options table{font-size:12px;min-width:900px}.options td,.options th{padding:9px 10px;border-color:#344336}.options select{padding:7px;background:#111e16;color:#ecf3ee;border:1px solid #435547;border-radius:6px}.fail-reason{font-size:11px;color:#c8ab85;max-width:220px;white-space:normal}.settings{padding:20px 26px;border-bottom:1px solid var(--line);background:#18251e}.settings-grid{display:flex;gap:14px;flex-wrap:wrap;align-items:end}.settings label{display:block;font-size:12px;color:#b8c6bc}.settings input{display:block;width:125px;border:1px solid #435549;border-radius:6px;background:#0e1912;color:white;margin-top:4px;padding:7px}.footer{padding:14px 26px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;color:#839b8b;font-size:11px;border-top:1px solid var(--line)}details summary{cursor:pointer;color:#a6b9ac}.spinner{color:#c5d5cb;font-size:12px}.help{max-width:760px;white-space:normal;line-height:1.8}.inactive{font-size:12px;color:#95a89c;padding:10px 0}.options .num{white-space:nowrap}.loading{padding:32px 26px;color:#b6c7bb}.loading:before{content:\"\";display:inline-block;width:12px;height:12px;border:2px solid #4b7860;border-top-color:#95e4b6;border-radius:50%;margin-right:10px;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.loading:before{animation:none}}@media(max-width:760px){.intro,.toolbar,.stats,.footer,.note,.notice,.settings{padding-left:16px;padding-right:16px}.stat{min-width:105px;padding-right:15px}.stat strong{font-size:21px}.spikes{min-width:190px}th,td{padding:12px}h2{font-size:20px}.bar{gap:10px}.options{padding:16px}} \n\n.explain-tag{text-align:left;line-height:1.5}.explain-tag:hover{filter:brightness(1.2);text-decoration:underline;text-underline-offset:3px}.explain-tag:focus-visible{outline:2px solid #a0edcd}.direct-options{display:block;font-size:11px;margin-top:8px;white-space:nowrap}.tag-dialog{width:min(620px,calc(100vw - 32px));max-height:calc(100vh - 48px);overflow:auto;border:1px solid #456552;border-radius:16px;background:#15241b;color:#e5f0e8;padding:24px;box-shadow:0 24px 90px #0009;font:14px/1.65 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Arial,sans-serif}.tag-dialog::backdrop{background:#000a;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}.dialog-head h2{font-size:20px;margin:0}.tag-dialog p{margin:12px 0}.tag-dialog dl{margin:18px 0;border-top:1px solid #344a3c}.tag-dialog dl>div{display:flex;justify-content:space-between;gap:24px;padding:8px 0;border-bottom:1px solid #344a3c}.tag-dialog dt{color:#9fb6a6}.tag-dialog dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}.tag-dialog .btn{flex:none}\n\n.stock-row{cursor:pointer;outline-offset:-2px}.stock-row:focus-visible{outline:2px solid #a0edcd}.stock-row:hover{background:#1c302380}.stock-row.selected{box-shadow:inset 3px 0 #6be4b4;background:#1c362880}.stock-open{border:0;background:none;padding:0;text-align:left;line-height:1.5}.stock-open:hover{text-decoration:underline;text-underline-offset:3px}.calls-cell{min-width:132px}.calls-cell .btn{white-space:nowrap}.calls-drawer{position:fixed;z-index:2147483000;top:12px;right:12px;bottom:12px;width:min(510px,calc(100vw - 24px));display:flex;flex-direction:column;background:#101c15;border:1px solid #486d55;border-radius:16px;box-shadow:-14px 0 70px #0009;outline:none}.calls-head{padding:18px 20px 14px;display:flex;gap:16px;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--line);flex:none}.calls-head h2{font-size:20px;letter-spacing:-.3px;margin-bottom:5px}.calls-head .btn{padding:4px 9px;flex:none}.calls-body{overflow:auto;overscroll-behavior:contain;flex:1;padding:16px 20px;scrollbar-gutter:stable}.call-controls{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.call-controls select{background:#182c20;border:1px solid #3a5944;border-radius:6px;padding:6px;color:#f1f5f2;margin-left:5px}.call-source{font-size:11px;line-height:1.8;color:#91aa99;margin-bottom:9px}.call-source strong{color:#d9e8de;font-weight:500}.call-state{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:9px 0 14px}.call-state .small{font-size:11px}.snapshot-notice{background:#352f20;border:1px solid #5c4b2e;color:#e2c68e;padding:8px 10px;border-radius:7px;font-size:12px;margin:0 0 12px}.call-cards{display:grid;gap:12px}.call-card{padding:14px;background:#17271c;border:1px solid #344b39;border-radius:12px}.call-card.call-live{border-color:#2c6749}.call-card-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.call-card h3{display:flex;align-items:center;gap:9px;margin:0;font-size:16px;font-weight:600}.call-index{display:inline-grid;place-items:center;width:23px;height:23px;border-radius:6px;background:#2b4332;color:#a1c9af;font-size:12px;font-weight:500}.distance{font-size:12px;color:#a2c8b2;white-space:nowrap}.call-money{display:grid;grid-template-columns:1fr 1.3fr;gap:8px}.call-money>div{display:flex;flex-direction:column}.call-money strong{font-size:23px;font-weight:600;line-height:1.4;letter-spacing:-.6px;font-variant-numeric:tabular-nums}.call-money .small{font-size:11px}.profit-block{text-align:right}.ltp-reference{margin:7px 0;color:#9bad9e;font-size:11px}.call-bottom{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.call-bottom .small{font-size:11px}.call-bottom strong{color:#c0d5c7;font-weight:500}.call-depth{margin-top:9px;border-top:1px solid #2f4736;padding-top:7px;font-size:11px}.call-depth summary{color:#a0b5a8}.call-depth dl{margin:8px 0 0}.call-depth dl>div{display:flex;gap:16px;justify-content:space-between;padding:5px 0;border-bottom:1px solid #2b3e30}.call-depth dt{color:#819e8a}.call-depth dd{margin:0;text-align:right;color:#c4d6ca;font-variant-numeric:tabular-nums}.failed-checks{margin-top:8px;color:#d5b67d}.calls-foot{padding:12px 20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;flex:none}.chain-link{font-size:12px;font-weight:500}.calls-foot .small{font-size:10px}.more-calls{width:100%;margin-top:14px}.call-count{margin-top:10px;font-size:11px}.payoff-note{font-size:11px;color:#92a898;line-height:1.7;margin:15px 0 0}.calls-body .notice{padding:12px;border:1px solid #66422f;border-radius:8px}.calls-body .empty{padding:25px 8px}.calls-body .loading{padding:25px 0}@media(max-width:560px){.calls-drawer{top:6px;right:6px;bottom:6px;width:calc(100vw - 12px);border-radius:12px}.calls-head{padding:14px}.calls-body{padding:12px 14px}.calls-foot{padding:10px 14px}.call-money strong{font-size:22px}.call-card{padding:12px}.call-state .small{max-width:100%}}\n\n.calls-head{padding:14px 18px 11px}.calls-head h2{font-size:19px}.calls-head .small{font-size:11px}.calls-body{padding:12px 18px}.call-controls{margin-bottom:8px}.call-controls .btn{padding:5px 10px}.call-controls select{padding:5px}.call-source{line-height:1.6;margin-bottom:6px}.call-state{margin:6px 0 11px}.call-cards{gap:10px}.call-card{padding:11px 12px}.call-card-head{margin-bottom:5px}.call-money strong{font-size:22px;line-height:1.25}.ltp-reference{margin:5px 0;font-size:10px}.call-card-status{float:right;margin-top:4px}.call-depth{margin-top:5px;padding-top:4px}.call-depth summary{line-height:24px;font-size:11px}.call-depth dl{clear:both}.call-card .pill{font-size:10px;padding:2px 6px}.call-count{margin-top:8px}.payoff-note{margin-top:12px}.calls-foot{padding:10px 18px}\n\n.calls-cell .btn{display:inline-flex;white-space:nowrap}.source-checks{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:6px 0}.source-checks .small{font-size:10px}.failed-checks{font-size:11px;line-height:1.5;margin:6px 0;color:#e3c087}.range-exception{margin:3px 0 7px}.call-depth dd{overflow-wrap:anywhere;max-width:64%}.settings label.near-setting{display:flex;align-items:center;gap:8px;margin-top:14px}.settings .near-setting input{display:inline-block;width:15px;height:15px;margin:0}.near-setting input{accent-color:var(--green)}\n\n.coverage-line{padding:10px 26px;border-bottom:1px solid var(--line);line-height:1.6}.current-returns{max-width:300px;font-variant-numeric:tabular-nums;line-height:1.7}.pattern-tags{margin-top:6px}.pattern-details{margin-top:5px;color:#9bac9f;font-size:11px}.pattern-details>summary{cursor:pointer;line-height:1.7}.pattern-details>.tags{margin-top:7px}.pattern-details .spike-tag{font-size:10px}.burst-count{font-size:11px}.spikes{min-width:280px}.spikes .pill{white-space:normal;text-align:left}\n\n.export-ready{padding:12px 26px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line)}\n.rise-value{display:block;border:0;background:transparent;color:#c6d6cd;padding:0;margin:0 0 2px;text-align:left;font-size:22px;line-height:1.35;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.5px}.rise-value.positive{color:#54d8a6}.rise-value:hover{text-decoration:underline;text-underline-offset:3px}.spikes>.tags{margin-top:7px}.sample-context{font-size:10px;line-height:1.7}.stats .stat{padding-bottom:5px}\n.table-scroll table{table-layout:fixed;min-width:1120px}.table-scroll th:nth-child(1){width:18%}.table-scroll th:nth-child(2){width:29%}.table-scroll th:nth-child(3){width:13%}.table-scroll th:nth-child(4){width:10%}.table-scroll th:nth-child(5){width:17%}.table-scroll th:nth-child(6){width:13%}.table-scroll td:nth-child(5) .pill{white-space:normal}\n.quote-warning{color:#e2c68e;white-space:normal;max-width:145px}\n\n.scanner-pipeline{list-style:none;margin:0;padding:16px 26px 10px;display:grid;grid-template-columns:repeat(5,minmax(116px,1fr));gap:8px;overflow-x:auto;border-top:0}.scanner-pipeline>li{min-width:0;position:relative}.pipeline-step,.pipeline-source{width:100%;height:100%;min-height:112px;display:flex;flex-direction:column;align-items:flex-start;text-align:left;border:1px solid #32463c;border-radius:10px;padding:10px 12px;background:#14201a;color:#d8e5de;gap:2px}.pipeline-source{background:#111b16;color:#98ada2}.pipeline-step:hover{border-color:#70c9a7;background:#1a2d23}.pipeline-step[aria-pressed=true]{border-color:#53d4a5;background:#173c2b;box-shadow:inset 0 0 0 1px #53d4a5}.pipeline-step strong,.pipeline-source strong{font-size:25px;line-height:1.2;font-variant-numeric:tabular-nums}.pipeline-step>span:not(.step-number),.pipeline-source>span:not(.step-number){font-size:13px;font-weight:600}.pipeline-step small,.pipeline-source small{font-size:10px;color:#91aaa0;line-height:1.4}.step-number{font-size:10px;color:#8aa99a;line-height:1.1}.pipeline-help{padding:0 26px 13px;display:flex;justify-content:space-between;gap:5px 16px;flex-wrap:wrap;color:var(--muted);font-size:11px;border-bottom:1px solid var(--line)}.pipeline-help strong{font-weight:500;color:#bccfc4}.view-label{font-size:12px;color:var(--muted)}.view-label strong{color:#d7eee1}.data-health{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:10px 26px;color:#9fb6a9;font-size:12px;border-bottom:1px solid var(--line)}.data-health strong{color:#d5eadd;font-variant-numeric:tabular-nums}.data-details{padding:9px 26px;border-bottom:1px solid var(--line);font-size:11px;color:#98ada2}.data-details>summary{cursor:pointer}.data-details ul{padding-left:18px;line-height:1.7}.data-details p{margin:8px 0}.filter-summary{padding:10px 26px;background:#1d2a22;border-bottom:1px solid var(--line);font-size:12px;color:#b6cabd;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.filter-summary .btn{margin-left:auto;font-size:11px;padding:5px 9px}.empty p{margin:8px 0 13px}.waiting-value{font-size:15px;letter-spacing:0;color:#d9bf83}.waiting-detail{line-height:1.5;max-width:285px}.quote-warning{font-size:10px}.pipeline-step:focus-visible{outline:2px solid #b1f6d8;outline-offset:2px}@media(max-width:600px){.scanner-pipeline{grid-template-columns:repeat(5,132px);padding:12px 14px 10px}.pipeline-help,.data-health,.data-details,.filter-summary{padding-left:14px;padding-right:14px}}\n.scanner-pipeline>li:not(:last-child)::after{content:'›';position:absolute;right:-7px;top:45px;z-index:1;color:#85a695;font-size:20px;pointer-events:none}\n/* Prevent the browser from moving the page to follow a row as ranks change. */\n:host{overflow-anchor:none}.table-scroll{overflow-anchor:none}\n.status{display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:390px;font-variant-numeric:tabular-nums}.monitor-heading{display:flex;align-items:center;gap:9px}.monitor-heading strong{font-size:12px;font-weight:600;color:#d4e9dd}.background-note{font-size:10px;color:#88a195;line-height:1.6}\n";
 const HOST_ID = "groww-strategy-view-v1";
 const routeMatches = () => location.pathname.replace(/\/$/,"")==="/futures-and-options/top-gainers";
+const collectorLockName = () => "groww-strategy-collector-v1"+(location.hostname==="127.0.0.1"?`-preview-${new URLSearchParams(location.search).get("scenario") || "normal"}`:"");
 const escapeHTML = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const moneyFormatter = new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:2,minimumFractionDigits:2});
 const countFormatter = new Intl.NumberFormat("en-IN",{maximumFractionDigits:0});
@@ -972,24 +1082,117 @@ const money = value => value===null || value===undefined ? "—" : moneyFormatte
 const count = value => value===null || value===undefined ? "—" : countFormatter.format(value);
 const percent = value => value===null || value===undefined ? "—" : `${value>=0?"+":""}${value.toFixed(2)}%`;
 const riseText = value => value===null || value===undefined ? "Unavailable" : value>0 && value<0.01 ? "<0.01% rise" : `${percent(value)}${value>0?" rise":""}`;
-const clockText = value => value ? clockFormatter.format(value) : "—";
+const clockCache=new Map();
+const clockText = value => {
+  if(!value)return "—";
+  let text=clockCache.get(value);
+  if(!text){text=clockFormatter.format(value);clockCache.set(value,text);if(clockCache.size>128)clockCache.delete(clockCache.keys().next().value);}
+  return text;
+};
 const dateTimeText = value => value ? `${istDay(value)} ${clockText(value)} IST` : "Unavailable";
-const tagButton = (html,info,className="pill") => `<button type="button" class="${className} explain-tag" data-action="explain" data-explanation="${escapeHTML(JSON.stringify(info))}" aria-label="Explain ${escapeHTML(info.title)}" title="Click for explanation">${html}</button>`;
+const tagButton = (html,info,className="pill") => `<button type="button" class="${className} explain-tag" data-action="explain" ${info.lazy?`data-explain-kind="${escapeHTML(info.lazy.kind)}" data-explain-symbol="${escapeHTML(info.lazy.symbol || "")}" data-explain-label="${escapeHTML(info.lazy.label || "")}"${info.lazy.event?` data-explain-event="${escapeHTML(info.lazy.event)}"`:""}${info.lazy.strike?` data-explain-strike="${escapeHTML(info.lazy.strike)}"`:""}`:`data-explanation="${escapeHTML(JSON.stringify(info))}"`} aria-label="Explain ${escapeHTML(info.title)}" title="Click for explanation">${html}</button>`;
 const pill = (text,tone="",info=null) => info ? tagButton(escapeHTML(text),typeof info==="string"?{title:text,paragraphs:[info]}:{title:text,...info},`pill ${tone}`) : `<span class="pill ${tone}">${escapeHTML(text)}</span>`;
+// Keep live rows and their interactive descendants mounted. The next tree is a small
+// shell; stock rows are reconciled separately and unchanged cells are never parsed.
+const domKey = node => {
+  if(node.nodeType!==1)return null;
+  const explicit=node.getAttribute("data-ui-key") || node.id;if(explicit)return explicit;
+  if(node.tagName==="TR" && node.dataset.symbol)return `stock:${node.dataset.symbol}`;
+  if(node.tagName==="DETAILS")return node.dataset.strike?`strike:${node.dataset.strike}`:node.dataset.patterns?`patterns:${node.dataset.patterns}`:null;
+  if(node.tagName==="BUTTON" && node.dataset.action)return `button:${node.dataset.action}:${node.dataset.mode || ""}:${node.dataset.symbol || node.dataset.explainSymbol || ""}:${node.dataset.explainKind || ""}:${node.dataset.explainLabel || node.getAttribute("aria-label") || ""}:${node.dataset.explainEvent || ""}`;
+  return null;
+};
+const htmlText = html => [...html.matchAll(/>([^<]+)(?=<)/g)].map(match=>match[1].replace(/&(?:amp|lt|gt|quot|#39);/g,value=>({"&amp;":"&","&lt;":"<","&gt;":">","&quot;":'"',"&#39;":"'"}[value])));
+function patchCellText(node,previousHTML,nextHTML) {
+  if(previousHTML.replace(/>[^<]*</g,"><")!==nextHTML.replace(/>[^<]*</g,"><"))return false;
+  const previous=htmlText(previousHTML),values=htmlText(nextHTML),nodes=[];
+  if(previous.length!==values.length)return false;
+  if(node.ownerDocument?.createTreeWalker) {
+    const walker=node.ownerDocument.createTreeWalker(node,4);let text;while((text=walker.nextNode()))nodes.push(text);
+  } else {
+    const visit=element=>{for(const child of element.childNodes)if(child.nodeType===3)nodes.push(child);else visit(child);};visit(node);
+  }
+  // A mismatch means the browser normalized the markup or an interaction changed
+  // its structure. Fall back to the full safe DOM reconciliation in that case.
+  if(nodes.length!==values.length || nodes.some((text,i)=>text.nodeValue!==previous[i]))return false;
+  for(let i=0;i<nodes.length;i++)if(nodes[i].nodeValue!==values[i])nodes[i].nodeValue=values[i];
+  return true;
+}
+function patchDOMNode(current,next) {
+  if(current.isEqualNode?.(next))return current;
+  if(current.nodeType!==next.nodeType || current.nodeType===1 && current.tagName!==next.tagName) {current.replaceWith(next);return next;}
+  if(current.nodeType!==1) {if(current.nodeValue!==next.nodeValue)current.nodeValue=next.nodeValue;return current;}
+  const keepOpen=current.tagName==="DETAILS" && current.open;
+  for(const attr of [...current.attributes])if(attr.name!=="open" && !next.hasAttribute(attr.name))current.removeAttribute(attr.name);
+  for(const attr of [...next.attributes])if(attr.name!=="open" && current.getAttribute(attr.name)!==attr.value)current.setAttribute(attr.name,attr.value);
+  if(current.matches("input[type=checkbox]"))current.checked=next.checked;
+  if(current.getAttribute("data-ui-list")!=="stocks")patchDOMChildren(current,next);
+  if(keepOpen)current.open=true;
+  return current;
+}
+function patchDOMChildren(current,next) {
+  const keyed=new Map([...current.childNodes].map(node=>[domKey(node),node]).filter(([key])=>key));
+  let cursor=current.firstChild;
+  const retained=new Set();
+  for(const nextNode of [...next.childNodes]) {
+    const key=domKey(nextNode);
+    let node=key?keyed.get(key):cursor && !domKey(cursor)?cursor:null;
+    if(node && (node.nodeType!==nextNode.nodeType || node.nodeType===1 && node.tagName!==nextNode.tagName))node=null;
+    if(node)node=patchDOMNode(node,nextNode);else node=nextNode;
+    if(node!==cursor)current.insertBefore(node,cursor);else cursor=cursor.nextSibling;
+    retained.add(node);
+  }
+  for(const node of [...current.childNodes])if(!retained.has(node))node.remove();
+}
 const storage = {
   get:(key,fallback)=>Promise.resolve(GM_getValue(CACHE_PREFIX+key,fallback)),
   set:(key,value)=>Promise.resolve(GM_setValue(CACHE_PREFIX+key,value)),
 };
 function cleanSettings(value) {
-  const s={...DEFAULTS};
+  const s={...DEFAULTS,scannerView:"all",filterVersion:1,eligibleOnly:false};
   if (!value || typeof value!=="object") return s;
   s.mode=value.mode==="groww"?"groww":"strategy";
-  s.eligibleOnly=value.eligibleOnly===true;
+  // The old checkbox mixed stock eligibility with changing option availability.
+  // Migrate it to the stable, results-clear watchlist once; focused views are explicit.
+  s.scannerView=["all","stock","rising","calls"].includes(value.scannerView)?value.scannerView:"all";
   s.nearTarget=value.nearTarget!==false;
   for (const k of ["minDay","minDistance"]) {
     const v=numeric(value[k]);if (v!==null && v>=0 && v<=100) s[k]=v;
   }
   return s;
+}
+function scannerPipeline(rows,fresh,open=true) {
+  const stock=rows.filter(row=>open && fresh && row.check.pass);
+  const rising=stock.filter(row=>row.spikes.one?.ready && row.spikes.one.pct>0);
+  return {all:rows,stock,rising,calls:rising.filter(row=>row.option.pass)};
+}
+function monitoringPresentation({collector,visibility,owner,now,updatedAt,latestSourceAt,freshPrices,total,market,cooldown}) {
+  const sourceAgeSeconds=latestSourceAt?Math.max(0,Math.floor((now-latestSourceAt)/1000)):null;
+  const sourceFresh=Number.isFinite(latestSourceAt) && latestSourceAt>0 && now-latestSourceAt<=30_000 && latestSourceAt<=now+10_000;
+  const live=!!market.open && sourceFresh && freshPrices>0 && now-updatedAt<=30_000 && updatedAt<=now+10_000 && !(cooldown?.until>now);
+  let status=!market.open?market.label:collector?(visibility==="hidden"?"Monitoring in background · 10s target":"Monitoring · 10s target"):
+    owner && live?"Updated by another Strategy tab":"Connecting to collector";
+  if(market.open && total && (!freshPrices || !sourceFresh))status="Monitoring · waiting for fresh source prices";
+  if(cooldown?.until>now)status=`Sampling paused · retry ${clockText(cooldown.until)} IST`;
+  const detail=latestSourceAt?`Latest source ${clockText(latestSourceAt)} IST · ${sourceAgeSeconds}s old`:"Waiting for the first verified source price";
+  return {status,detail,live,sourceAgeSeconds};
+}
+function momentumPresentation(stock,spikes,now,market) {
+  if(!market.open)return {label:"Snapshot only",detail:market.label || "Market closed",tone:"",reason:"closed"};
+  const reason=spikes.one?.reason || spikes.coverage?.reason;
+  if(!spikes.one?.ready) {
+    if(reason==="stale")return {label:"Waiting for fresh price",detail:`Last verified price kept · source ${clockText(stock.quoteAt)} IST. Momentum is paused.`,tone:"amber",reason};
+    if(reason==="gap")return {label:"Rebuilding 1m history",detail:"A source gap exceeded 30s. Collecting a continuous minute again.",tone:"amber",reason};
+    if(reason==="inconsistent")return {label:"Rechecking quote",detail:"Source values disagree. Last verified price kept; momentum is paused.",tone:"amber",reason};
+    if(reason==="missing-anchor")return {label:"Waiting for comparison",detail:"No real sample within 10s of the 60s comparison point. Waiting for the next quote.",tone:"amber",reason};
+    if(reason==="warming") {
+      const elapsed=spikes.coverage?.since?Math.max(0,Math.floor(((spikes.coverage.lastQuoteAt || now)-spikes.coverage.since)/1000)):0;
+      return {label:"Building first minute",detail:`${Math.min(60,elapsed)}s of 60s collected. New arrivals start here.`,tone:"amber",reason};
+    }
+    return {label:"Waiting for price",detail:"No usable source quote yet. Last verified values stay visible when available.",tone:"amber",reason:reason || "unavailable"};
+  }
+  return {label:spikes.confirmed?"Strong rise confirmed":spikes.verifying?"Strong rise · verifying":spikes.one.pct>0?"Rising now":spikes.one.pct<0?"Falling now":"Flat now",
+    detail:`${spikes.one.seconds}s observed · ${clockText(spikes.one.endAt)} IST`,tone:spikes.confirmed?"green":spikes.verifying?"amber":"",reason:"complete"};
 }
 function safeEngine(saved) {
   if (saved?.source!==PRICE_SOURCE || !saved?.states || typeof saved.states!=="object") return new SpikeEngine();
@@ -1010,17 +1213,31 @@ function scrubResults(snapshot,now=Date.now(),membership=null,onWithhold=()=>{})
     snapshot.resultsUnavailableCount=checks.filter(x=>x.result.unknown).length;
     snapshot.membershipCount=all.length;
   }
-  const identities=new Map(original.map(stock=>[stockKey(stock),stock]));
+  const bySymbol=new Map(Object.values(snapshot.identities || {}).map(stock=>[stock.symbol,stock]));
+  const canonical=value=>value?.priceSource===PRICE_SOURCE && value.spot>0 && value.previousClose>0 && Number.isFinite(value.quoteAt) && value.quoteAt<=now+10_000;
+  const retainIdentity=(stock,authoritative=false)=>{
+    if(!stock?.symbol)return;
+    const previous=bySymbol.get(stock.symbol);
+    if(previous && stockKey(previous)!==stockKey(stock)){if(authoritative)bySymbol.set(stock.symbol,stock);return;}
+    if(!previous || canonical(stock) && (!canonical(previous) || stock.quoteAt>previous.quoteAt || stock.quoteAt===previous.quoteAt && stock.quoteConflictAt && !previous.quoteConflictAt))bySymbol.set(stock.symbol,stock);
+  };
+  for(const state of Object.values(snapshot.engine?.states || {}))if(state.identity)retainIdentity(state.identity);
+  for(const stock of original)retainIdentity(stock,true);
+  for(const option of Object.values(snapshot.options || {}))if(option.stockRef)retainIdentity(option.stockRef);
+  const identities=new Map([...bySymbol.values()].map(stock=>[stockKey(stock),stock]));
   snapshot.stocks=original.filter(stock=>{
     const allowed=resultsAllowed(stock,snapshot.calendar,snapshot.window,now);
     if(!allowed)onWithhold(stock);
     return allowed;
   });
-  const allowedSymbols=new Set(snapshot.stocks.map(stock=>stock.symbol));
-  snapshot.options=Object.fromEntries(Object.entries(snapshot.options || {}).filter(([key,value])=>{
-    const symbol=value?.symbol || key.split("|")[0],allowed=allowedSymbols.has(symbol);
-    if(!allowed)onWithhold({symbol});return allowed;
+  for(const field of ["options","optionSummaries"])snapshot[field]=Object.fromEntries(Object.entries(snapshot[field] || {}).filter(([key,value])=>{
+    const symbol=value?.symbol || key.split("|")[0],stock=value?.stockRef || bySymbol.get(symbol);
+    const allowed=!!stock && resultsAllowed(stock,snapshot.calendar,snapshot.window,now);
+    if(!allowed)onWithhold(stock || {symbol});return allowed;
   }));
+  snapshot.identities=Object.fromEntries([...bySymbol].filter(([_symbol,stock])=>resultsAllowed(stock,snapshot.calendar,snapshot.window,now)));
+  const currentKeys=new Set(snapshot.stocks.map(stockKey));
+  if(snapshot.signals)snapshot.signals=Object.fromEntries(Object.entries(snapshot.signals).filter(([key])=>currentKeys.has(key)));
   if(snapshot.engine?.states)for(const [key,state] of Object.entries(snapshot.engine.states)) {
     const stock=identities.get(key) || state.identity;
     if(!stock || !resultsAllowed(stock,snapshot.calendar,snapshot.window,now)) {
@@ -1037,11 +1254,16 @@ class StrategyApp {
     this.settingsOpen=false;this.uiError="";this.alive=true;this.explanation=null;this.explanationTrigger=null;
     this.activePointers=new Set();this.renderPending=false;this.pendingRenderForce=false;this.renderFlushTimer=null;
     this.renderedRoot=null;this.renderedHTML=null;this.exporting=false;this.diagnosticError=null;
+    this.rowHTMLCache=new Map();this.optionStatusCache=new WeakMap();this.signalCache=new Map();this.pendingRows=[];
+    this.renderHistory=[];
     this.archive=new DiagnosticArchive({name:"groww-strategy-diagnostics-v2"+(location.hostname==="127.0.0.1"?"-preview-"+new URLSearchParams(location.search).get("scenario"):""),
       onStatus:error=>{this.diagnosticError=error;this.render();}});
   }
   async start() {
-    this.settings=cleanSettings(await storage.get("settings",DEFAULTS));
+    const savedSettings=await storage.get("settings",DEFAULTS);
+    this.filterMigrationNotice=savedSettings?.filterVersion!==1 && savedSettings?.eligibleOnly===true;
+    this.settings=cleanSettings(savedSettings);
+    if(savedSettings?.filterVersion!==1)await storage.set("settings",this.settings);
     this.snapshot=await storage.get("snapshot",this.snapshot);
     if (!Array.isArray(this.snapshot?.stocks) || typeof this.snapshot?.options!=="object") this.snapshot={stocks:[],options:{},updatedAt:0};
     if (this.snapshot.pricingVersion!==2) {
@@ -1051,10 +1273,11 @@ class StrategyApp {
     this.adoptCalendar(cachedCalendar,cachedHolidays);
     this.acceptSnapshot(this.snapshot);
     GM_addValueChangeListener(CACHE_PREFIX+"snapshot",(_key,_old,value)=>{
-      if (value && Array.isArray(value.stocks)) {const removed=this.acceptSnapshot(value);this.render(removed);}
+      if (value && Array.isArray(value.stocks) && !(value.owner===this.id && value.revision===this.snapshot.revision)) {const removed=this.acceptSnapshot(value);this.render(removed);}
     });
     GM_addValueChangeListener(CACHE_PREFIX+"command",(_key,_old,value)=>{
-      if (this.collector && value) this.collector.command(value);
+      if(value?.action==="foreground-collector")this.yieldCollector(value);
+      else if (this.collector && value) this.collector.command(value);
     });
     GM_addValueChangeListener(CACHE_PREFIX+"calendar",(_key,_old,value)=>{
       if(this.adoptCalendar(value,this.collector?.state.holidays || this.snapshot.holidays))this.render(true);
@@ -1067,7 +1290,15 @@ class StrategyApp {
     observer.observe(document.body,{childList:true,subtree:true});
     this.mount();
     this.coordinatorTimer=setInterval(()=>{this.mount();this.coordinate();this.render();},2000);
-    document.addEventListener("visibilitychange",()=>{if(document.visibilityState!=="visible")finishPointer({type:"blur"});this.coordinate();this.render();});
+    document.addEventListener("visibilitychange",()=>{
+      if(document.visibilityState!=="visible"){finishPointer({type:"blur"});this.coordinate();}
+      else this.resumeMonitoring();
+      this.render();
+    });
+    // A frozen page cannot service timers. Stop synchronously before releasing
+    // its lock so callbacks delivered on resume cannot revive an old collector.
+    document.addEventListener("freeze",()=>{this.lifecycleSuspended=true;try{this.collector?.stop();}finally{this.releaseLock?.();}});
+    document.addEventListener("resume",()=>{this.lifecycleSuspended=false;this.resumeMonitoring();this.render();});
     const finishPointer=event=>{
       if (event?.type==="blur") this.activePointers.clear();
       else this.activePointers.delete(event.pointerId);
@@ -1085,7 +1316,7 @@ class StrategyApp {
     window.addEventListener("pagehide",()=>{this.activePointers.clear();clearTimeout(this.renderFlushTimer);this.stop();});
     window.addEventListener("pageshow",event=>{
       if (!event.persisted)return;
-      this.alive=true;
+      this.alive=true;this.lifecycleSuspended=false;
       clearInterval(this.coordinatorTimer);
       this.coordinatorTimer=setInterval(()=>{this.mount();this.coordinate();this.render();},2000);
       this.mount();this.coordinate();this.render(true);
@@ -1094,6 +1325,12 @@ class StrategyApp {
   }
   acceptSnapshot(value) {
     const previous=this.snapshot.stocks || [];
+    const staleOwner=(value.ownerStartedAt || 0)<(this.snapshot.ownerStartedAt || 0) ||
+      value.owner===this.snapshot.owner && Number.isFinite(value.revision) && Number.isFinite(this.snapshot.revision) && value.revision<this.snapshot.revision;
+    if(staleOwner) {
+      if((value.calendar?.fetchedAt || 0)<=(this.snapshot.calendar?.fetchedAt || 0))return false;
+      value={...this.snapshot,calendar:value.calendar,window:value.window,holidays:value.holidays};
+    }
     // A delayed write from another tab cannot replace a newer calendar decision.
     if((this.snapshot.calendar?.fetchedAt || 0)>(value.calendar?.fetchedAt || 0)) {
       value={...value,calendar:this.snapshot.calendar,window:this.snapshot.window,holidays:this.snapshot.holidays};
@@ -1121,7 +1358,8 @@ class StrategyApp {
     // Explanations are current UI too: never leave an excluded stock's details open.
     if(this.explanation?.title) {
       const symbol=this.explanation.title.split(" · ")[0];
-      if(!this.snapshot.stocks.some(stock=>stock.symbol===symbol || this.explanation.title.startsWith(stock.symbol+" ")) && this.explanation.title.includes(" · "))this.explanation=null;
+      const available=[...this.snapshot.stocks,...(this.selectedStock?[this.selectedStock]:[])];
+      if(!available.some(stock=>stock.symbol===symbol || this.explanation.title.startsWith(stock.symbol+" ")) && this.explanation.title.includes(" · "))this.explanation=null;
     }
     return previousSymbol!==this.selectedSymbol || previousExplanation!==this.explanation;
   }
@@ -1154,6 +1392,9 @@ class StrategyApp {
     if (!this.nativeNodes.size) this.nativeNodes.set(table,{value:table.style.getPropertyValue("display"),priority:table.style.getPropertyPriority("display")});
     this.root.addEventListener("click",event=>this.click(event));
     this.root.addEventListener("pointerdown",event=>this.activePointers.add(event.pointerId),true);
+    this.root.addEventListener("pointermove",event=>{
+      if(event.target.closest('tr[data-action="open-calls"]'))this.rowInteractionUntil=Date.now()+500;
+    },{passive:true});
     this.root.addEventListener("change",event=>this.change(event));
     this.root.addEventListener("submit",event=>this.submit(event));
     this.root.addEventListener("cancel",event=>{if(event.target.matches("dialog")){event.preventDefault();this.closeExplanation();}},true);
@@ -1175,23 +1416,54 @@ class StrategyApp {
       else if (old.value) node.style.setProperty("display",old.value,old.priority);else if(node.style.getPropertyValue("display")) node.style.removeProperty("display");
     }
   }
-  wantsCollector() {return this.alive && routeMatches() && this.settings.mode==="strategy" && document.visibilityState==="visible";}
+  wantsCollector() {return this.alive && !this.lifecycleSuspended && routeMatches() && this.settings.mode==="strategy";}
+  resumeMonitoring() {
+    if(!this.wantsCollector() || document.visibilityState!=="visible")return;
+    this.coordinate();this.collector?.resume();
+  }
+  requestForegroundCollector() {
+    if(document.visibilityState!=="visible" || !this.wantsCollector() || Date.now()-(this.foregroundRequestAt || 0)<10_000)return;
+    this.foregroundRequestAt=Date.now();
+    storage.set("command",{id:crypto.randomUUID(),action:"foreground-collector",requester:this.id,at:Date.now()})
+      .catch(error=>{this.uiError=`Collector handover: ${error.message}`;});
+  }
+  async yieldCollector(command) {
+    const now=Date.now(),collector=this.collector;
+    if(command?.action!=="foreground-collector" || !command.requester || command.requester===this.id ||
+        !Number.isFinite(command.at) || now-command.at>15_000 || command.at>now+10_000 ||
+        document.visibilityState==="visible" || !collector || this.handingOver)return;
+    this.handingOver=true;this.yieldUntil=now+5000;
+    let deadline;
+    try {
+      const writes=[];
+      try {
+        collector.flushRecord();
+        writes.push(collector.checkpoint(),collector.publish(true),this.archive.flush());
+      } finally {collector.stop({drainWrites:true});}
+      await Promise.race([Promise.allSettled(writes),new Promise(resolve=>{deadline=setTimeout(resolve,1500);})]);
+    } catch(error){this.uiError=`Collector handover: ${error.message}`;}
+    finally {
+      clearTimeout(deadline);try{collector.stop();}finally{this.releaseLock?.();this.handingOver=false;}
+    }
+  }
   coordinate() {
     if (!this.wantsCollector()) {this.releaseLock?.();return;}
-    this.refreshSelectedCalls();
+    if(this.handingOver || document.visibilityState!=="visible" && Date.now()<(this.yieldUntil || 0))return;
+    if(document.visibilityState==="visible")this.refreshSelectedCalls();
     if (this.collector || this.lockPending) return;
     if (!navigator.locks) {this.uiError="This browser cannot coordinate collectors. Use current Chrome or Edge with Tampermonkey.";return;}
     this.lockPending=true;
-    navigator.locks.request("groww-strategy-collector-v1",{ifAvailable:true},async lock=>{
+    navigator.locks.request(collectorLockName(),{ifAvailable:true},async lock=>{
       this.lockPending=false;
-      if (!lock || !this.wantsCollector()) return;
+      if (!lock){this.requestForegroundCollector();return;}
+      if (!this.wantsCollector() || this.handingOver || document.visibilityState!=="visible" && Date.now()<(this.yieldUntil || 0))return;
       const collector=new Collector(this);this.collector=collector;
       try {
         await new Promise(resolve=>{
           this.releaseLock=resolve;
           collector.start().catch(e=>{this.uiError=e.message;this.render();resolve();});
         });
-      } finally {collector.stop();this.collector=null;this.releaseLock=null;this.render();}
+      } finally {try{collector.stop();}finally{this.collector=null;this.releaseLock=null;this.render();}}
     }).catch(e=>{this.lockPending=false;this.uiError=`Collector unavailable: ${e.message}`;this.render();});
   }
   refreshSelectedCalls() {
@@ -1207,8 +1479,9 @@ class StrategyApp {
   async saveSettings() {await storage.set("settings",this.settings);this.applyNativeVisibility();this.render(true);this.coordinate();}
   async send(action,data={}) {
     if(action==="options") {
-      const stock=this.snapshot.stocks.find(stock=>stock.symbol===data.symbol);
+      const stock=this.snapshot.stocks.find(stock=>stock.symbol===data.symbol) || (this.selectedStock?.symbol===data.symbol?this.selectedStock:null);
       if(!stock || !resultsAllowed(stock,this.snapshot.calendar,this.snapshot.window,Date.now()))return;
+      data={...data,identity:stock,selected:true,requester:this.id};
     }
     this.uiError="";
     const command={id:crypto.randomUUID(),at:Date.now(),action,...data};
@@ -1236,11 +1509,14 @@ class StrategyApp {
     const button=event.target.closest("button[data-action]") || (!event.target.closest("a,input,select,label,summary,details") && event.target.closest("tr[data-action]"));if (!button)return;
     const action=button.dataset.action;
     if (action==="explain") {
-      try {this.explanation=JSON.parse(button.dataset.explanation);this.explanationTrigger=button.getAttribute("aria-label");this.render(true);} catch {}
+      try {this.explanation=button.dataset.explainKind?this.resolveExplanation(button.dataset):JSON.parse(button.dataset.explanation);if(!this.explanation)return;this.explanationTrigger=button.getAttribute("aria-label");this.render(true);} catch {}
       return;
     }
     if (action==="close-explanation") {this.closeExplanation();return;}
     if (action==="mode") {this.settings.mode=button.dataset.mode;this.saveSettings();}
+    if (action==="scanner-view" && ["all","stock","rising","calls"].includes(button.dataset.view)) {
+      this.settings.scannerView=button.dataset.view;this.settings.filterVersion=1;this.settings.eligibleOnly=false;this.filterMigrationNotice=false;this.saveSettings();
+    }
     if (action==="settings") {this.settingsOpen=!this.settingsOpen;this.render(true);}
     if (action==="calendar") this.send("calendar");
     if (action==="refresh") this.send("refresh");
@@ -1267,7 +1543,6 @@ class StrategyApp {
     [...this.root.querySelectorAll('[data-action="explain"]')].find(el=>el.getAttribute("aria-label")===this.explanationTrigger)?.focus();
   }
   change(event) {
-    if (event.target.name==="eligibleOnly") {this.settings.eligibleOnly=event.target.checked;this.saveSettings();}
     if (event.target.name==="expiry") {
       const symbol=event.target.dataset.symbol;
       this.selectedExpiries[symbol]=event.target.value;
@@ -1287,76 +1562,258 @@ class StrategyApp {
     this.settings=settings;this.callLimit=3;this.settingsOpen=false;this.saveSettings();
   }
   getOptions(stock) {
-    if(!resultsAllowed(stock,this.snapshot.calendar,this.snapshot.window,Date.now()))return null;
+    if(!this.resultsFor(stock,this.renderTime ?? Date.now()).pass)return null;
     const expiry=this.selectedExpiries[stock.symbol];
     return this.snapshot.options?.[`${stock.symbol}|${expiry || "nearest"}`] ||
-      (expiry ? Object.values(this.snapshot.options || {}).find(x=>x.symbol===stock.symbol && x.expiry===expiry && !x.error) : null);
+      (expiry ? Object.values(this.snapshot.options || {}).find(x=>x.symbol===stock.symbol && x.expiry===expiry && !x.error) : null) ||
+      this.snapshot.optionSummaries?.[`${stock.symbol}|${expiry || "nearest"}`] || null;
+  }
+  resultsFor(stock,now) {
+    const state=this.snapshot;
+    if(this.resultsClock!==now){this.resultsClock=now;this.resultsDay=istDay(now);}
+    const key=`${state.window?.from}|${state.window?.to}|${this.resultsDay}`;
+    if(this.resultsCalendar!==state.calendar || this.resultsContext!==key) {this.resultsCalendar=state.calendar;this.resultsContext=key;this.resultsCache=new Map();}
+    const stockId=`${stock.gsin || ""}|${stock.searchId || ""}`;
+    let check=this.resultsCache.get(stockId);
+    if(!check){check=resultsCheck(stock,state.calendar,state.window,now);this.resultsCache.set(stockId,check);}
+    return check;
+  }
+  signalFor(stock,now) {
+    let signal=this.snapshot.signals?.[stockKey(stock)];
+    if(!signal) {
+      if(this.legacySignalSource!==this.snapshot.engine) {this.legacySignalSource=this.snapshot.engine;this.legacySignalEngine=safeEngine(this.snapshot.engine);this.signalCache.clear();}
+      const key=`${stockKey(stock)}:${stock.quoteAt || 0}:${quoteFresh(stock,now)}`;
+      if(this.signalCache.size>400)this.signalCache.clear();
+      if(!this.signalCache.has(key))this.signalCache.set(key,(this.legacySignalEngine || safeEngine(null)).view(stock,now));
+      signal=this.signalCache.get(key);
+    }
+    const events=(signal.events || []).filter(event=>now-event.lastSeen<15*MINUTE);
+    if(events.length!==(signal.events || []).length || signal.peakOne?.ready && now-signal.peakOne.observedAt>=MINUTE)
+      signal={...signal,events,peakOne:signal.peakOne?.ready&&now-signal.peakOne.observedAt>=MINUTE?{ready:false}:signal.peakOne,patterns:{...signal.patterns,repeated:events.length>=2}};
+    if(quoteFresh(stock,now))return signal;
+    const reason=stock.quoteConflictAt?"inconsistent":stock.priceError?"unavailable":stock.quoteAt?"stale":"unavailable";
+    return {...signal,one:{...signal.one,ready:false,reason},five:{...signal.five,ready:false},fifteen:{...signal.fifteen,ready:false},confirmed:false,verifying:false,active:false,status:reason==="inconsistent"?"Inconsistent quote":reason==="stale"?"Quote stale":"Quote unavailable",coverage:{...signal.coverage,valid:false,reason}};
+  }
+  optionFor(stock,now,market) {
+    const snapshot=this.getOptions(stock);
+    if(!snapshot)return optionStatus(null,this.settings,now,market);
+    const settingsKey=`${this.settings.minDistance}:${this.settings.nearTarget}:${market.open}`;
+    const cached=this.optionStatusCache.get(snapshot);
+    if(cached?.key===settingsKey && now>=cached.at && now<cached.until)return cached.value;
+    const value=optionStatus(snapshot,this.settings,now,market);
+    const expiries=[snapshot.spotQuoteAt+30_001,snapshot.asOf+120_001,snapshot.fetchedAt+120_001,...(snapshot.items || []).map(item=>item.bookAt+60_001)].filter(at=>Number.isFinite(at) && at>now);
+    this.optionStatusCache.set(snapshot,{key:settingsKey,at:now,until:Math.min(now+30_000,...expiries),value});
+    return value;
+  }
+  lazyInfo(kind,stock,label,event=null,strike=null) {
+    return {title:`${stock.symbol} · ${label}`,lazy:{kind,symbol:stock.symbol,label,event,strike}};
+  }
+  resolveExplanation(data) {
+    const stock=this.snapshot.stocks.find(s=>s.symbol===data.explainSymbol) || (this.selectedStock?.symbol===data.explainSymbol?this.selectedStock:null);
+    if(!stock || !resultsAllowed(stock,this.snapshot.calendar,this.snapshot.window,Date.now()))return null;
+    const spikes=this.signalFor(stock,Date.now());
+    if(data.explainKind==="momentum")return this.momentumInfo(stock,spikes,data.explainLabel);
+    if(data.explainKind==="burst")return this.burstInfo(stock,spikes.events,spikes.events.find(e=>String(e.id)===data.explainEvent));
+    if(data.explainKind==="check")return this.checkInfo(stock,stockCheck(stock,this.snapshot.calendar,this.snapshot.window,Date.now(),this.settings),data.explainLabel);
+    if(data.explainKind==="call")return this.callInfo(stock);
+    if(data.explainKind==="reference")return this.referenceInfo(stock,this.getOptions(stock)?.items?.find(item=>String(item.strike)===data.explainStrike) || {});
+    return null;
+  }
+  pipelineHTML(flow,state,view) {
+    const steps=[["all","All monitored",flow.all.length,"Results clear"],["stock","Stock eligible",flow.stock.length,`Day > +${this.settings.minDay}% + fresh price`],
+      ["rising","Rising now",flow.rising.length,"Positive current 1m return"],["calls","Calls ready",flow.calls.length,"Rising + fresh qualifying call"]];
+    return `<ol class="scanner-pipeline" aria-label="Scanner pipeline"><li class="pipeline-source"><span class="step-number">1</span><strong>${state.membershipCount ?? flow.all.length}</strong><span>Groww list</span><small>Current 15-minute gainers</small></li>${steps.map(([key,label,total,detail],index)=>`<li><button type="button" data-action="scanner-view" data-view="${key}" data-ui-key="pipeline-${key}" aria-pressed="${view===key}" aria-label="Show ${label.toLowerCase()}" class="pipeline-step"><span class="step-number">${index+2}</span><strong>${total}</strong><span>${label}</span><small>${detail}</small></button></li>`).join("")}</ol>
+      <div class="pipeline-help"><span>${state.resultsExcludedCount || 0} hidden for results${state.resultsUnavailableCount?` · ${state.resultsUnavailableCount} withheld until the calendar is verified`:""}. Click a stage to narrow the view.</span><span><strong>All monitored keeps waiting rows visible.</strong> Calls refreshing cannot empty that view.</span></div>`;
+  }
+  scannerEmptyHTML(flow,state,view) {
+    if(flow.all.length)return `<div class="empty"><strong>No ${view==="calls"?"rising stocks with fresh qualifying calls":view==="rising"?"stocks rising in 1m": "stocks passing the daily and fresh-price checks"} right now</strong><p>${flow.all.length} results-clear stocks are still monitored. This stage is a filter; the price history has not been cleared.</p><button class="btn" data-action="scanner-view" data-view="all">Show all monitored (${flow.all.length})</button></div>`;
+    if(state.resultsUnavailableCount)return '<div class="empty"><strong>Waiting for results calendar</strong><p>Stocks are withheld until today’s results coverage is verified. This mandatory check cannot be bypassed.</p><button class="btn" data-action="calendar">Refresh calendar</button></div>';
+    if(state.resultsExcludedCount)return '<div class="empty"><strong>Current candidates excluded for results</strong><p>The results gate hides these stocks from every Strategy view. Waiting for the next Groww list.</p></div>';
+    return '<div class="empty"><strong>Groww’s current candidate list is empty</strong><p>Waiting for the next 15-minute gainers refresh. Stocks that leave this list are no longer scanner candidates; a selected calls panel can remain open.</p></div>';
   }
   render(force=false) {
     if (!this.root)return;
-    const removed=(this.snapshot.stocks || []).some(stock=>!resultsAllowed(stock,this.snapshot.calendar,this.snapshot.window,Date.now()));
-    scrubResults(this.snapshot);force=this.pruneSelection() || force;
+    const timing=typeof performance!=="undefined"?()=>performance.now():()=>Date.now(),started=timing();
+    const removed=(this.snapshot.stocks || []).some(stock=>!this.resultsFor(stock,Date.now()).pass);
+    if(removed)scrubResults(this.snapshot);force=this.pruneSelection() || force;
+    // Collection and exclusion gates continue off-screen; paint only the latest
+    // state on return instead of repeatedly building an invisible table.
+    if(!force && typeof document!=="undefined" && document.visibilityState==="hidden" && this.renderedRoot===this.root){this.renderPending=true;return;}
     if (this.activePointers.size && !removed && !force) {this.renderPending=true;this.pendingRenderForce=this.pendingRenderForce || force;return;}
     force=force || removed;
     if (!force && (this.explanation || this.root.activeElement?.closest("form")))return;
     this.renderPending=false;this.pendingRenderForce=false;
-    const focusId=this.root.activeElement?.id,focusLabel=this.root.activeElement?.getAttribute("aria-label");
-    const callScroll=this.resetCallScroll?0:(this.root.querySelector(".calls-body")?.scrollTop || 0);
-    const tableScroll=this.root.getElementById("strategy-table-scroll")?.scrollLeft || 0;
-    const openDetails=[...this.root.querySelectorAll("details[data-strike][open]")].map(el=>el.dataset.strike);
-    const openPatterns=[...this.root.querySelectorAll("details[data-patterns][open]")].map(el=>el.dataset.patterns);
+    const focusedNode=this.root.activeElement,focusId=focusedNode?.id,focusLabel=focusedNode?.getAttribute("aria-label");
+    const priorCallBody=this.root.querySelector(".calls-body"),priorTable=this.root.getElementById("strategy-table-scroll");
+    const callScroll=this.resetCallScroll?0:(priorCallBody?.scrollTop || 0);
+    const tableScroll=priorTable?.scrollLeft || 0;
+    const openDetails=force?[...this.root.querySelectorAll("details[data-strike][open]")].map(el=>el.dataset.strike):[];
+    const openPatterns=force?[...this.root.querySelectorAll("details[data-patterns][open]")].map(el=>el.dataset.patterns):[];
     this.resetCallScroll=false;
     const now=Date.now(), state=this.snapshot, market=marketState(now,state.holidays);
-    const engine=safeEngine(state.engine), ordered=rankStocks(state.stocks || [],engine,now,{calendar:state.calendar,window:state.window,settings:this.settings});
+    this.renderTime=now;
+    const signals=new Map((state.stocks || []).map(stock=>[stockKey(stock),this.signalFor(stock,now)]));
     const opening=Date.parse(`${istDay(now)}T09:15:00+05:30`);
     const fresh=state.updatedAt>=opening && now-state.updatedAt<=30_000 && state.updatedAt<=now+10_000;
-    const rowData=ordered.map(stock=>({stock,spikes:engine.view(stock,now),check:stockCheck(stock,state.calendar,state.window,now,this.settings),
-      option:optionStatus(this.getOptions(stock),this.settings,now,market)}));
-    const leader=rowData.find(x=>x.check.pass && x.option.pass && fresh);
-    const visible=this.settings.eligibleOnly ? rowData.filter(x=>x.check.pass && x.option.pass && fresh) : rowData;
-    const selected=rowData.find(x=>x.stock.symbol===this.selectedSymbol) || (this.selectedStock&&resultsAllowed(this.selectedStock,state.calendar,state.window,now)?{stock:this.selectedStock,
-      check:{...stockCheck(this.selectedStock,state.calendar,state.window,now,this.settings),pass:false,reasons:["Outside current 15-minute list"]},
-      option:optionStatus(this.getOptions(this.selectedStock),this.settings,now,market)}:null);
-    const stockPassed=rowData.filter(x=>x.check.pass).length;
+    const rowData=(state.stocks || []).map(stock=>{const check=stockCheck(stock,state.calendar,state.window,now,this.settings,this.resultsFor(stock,now));
+      return {stock,spikes:signals.get(stockKey(stock)),check,option:this.optionFor(stock,now,market)};}).sort((a,b)=>{
+        const av=a.spikes.one?.ready&&Number.isFinite(a.spikes.one.pct),bv=b.spikes.one?.ready&&Number.isFinite(b.spikes.one.pct);
+        return Number(b.check.pass)-Number(a.check.pass) || Number(bv)-Number(av) ||
+          (av&&bv ? b.spikes.one.pct-a.spikes.one.pct || (b.spikes.coverage.lastQuoteAt || b.stock.quoteAt || 0)-(a.spikes.coverage.lastQuoteAt || a.stock.quoteAt || 0):0) || a.stock.rank-b.stock.rank;
+      });
+    const flow=scannerPipeline(rowData,fresh,market.open),view=["all","stock","rising","calls"].includes(this.settings.scannerView)?this.settings.scannerView:"all";
+    const leader=!state.membershipStale?flow.calls[0]:null;
+    const visible=flow[view];
+    if(this.selectedStock) this.selectedStock=state.stocks.find(s=>s.symbol===this.selectedSymbol) || state.identities?.[this.selectedSymbol] || this.selectedStock;
+    const selected=rowData.find(x=>x.stock.symbol===this.selectedSymbol) || (this.selectedStock&&resultsAllowed(this.selectedStock,state.calendar,state.window,now)?{stock:this.selectedStock,leftMembership:true,
+      check:stockCheck(this.selectedStock,state.calendar,state.window,now,this.settings),option:this.optionFor(this.selectedStock,now,market)}:null);
+    const priceFreshCount=rowData.filter(x=>quoteFresh(x.stock,now)).length;
+    const readyCount=rowData.filter(x=>x.spikes.one.ready).length;
     const tagTotal=rowData.reduce((sum,x)=>sum+x.spikes.events.length,0);
-    let status=this.collector ? (market.open ? "Sampling every 10s" : market.label) :
-      document.visibilityState!=="visible" ? "Paused while tab is inactive" : "Waiting for collector";
+    const monitoring=monitoringPresentation({collector:!!this.collector?.running,visibility:document.visibilityState,owner:state.owner,
+      now,updatedAt:state.updatedAt,latestSourceAt:Math.max(0,...rowData.map(row=>row.stock.quoteAt || 0)),freshPrices:priceFreshCount,total:rowData.length,market,cooldown:state.samplingCooldown});
+    let status=monitoring.status;
     if (!navigator.locks) status="Collector unsupported";
     const notices=[];
-    if (!market.open) notices.push(`${market.label}. Showing available snapshots; no live candidates qualify.`);
-    if (market.open && !fresh && state.updatedAt) notices.push("Price samples are stale. Live eligibility is paused until a fresh response arrives.");
-    if (state.error) notices.push(state.error);
+    if (!market.open && (market.known || state.updatedAt || state.calendarError)) notices.push(`${market.label}. Showing available snapshots; no live candidates qualify.`);
+    if (market.open && !fresh && state.updatedAt && !rowData.length) notices.push("Waiting for a fresh stock-price batch. Live eligibility is paused.");
+    if (state.error && !rowData.length) notices.push(state.error);
+    if(state.membershipError)notices.push(`Gainers list refresh: ${state.membershipError}. ${state.membershipStale?"Automatic calls paused until membership is verified.":"Continuing with the last verified list."}`);
+    else if(state.membershipStale)notices.push("Gainers membership has not been verified for at least five minutes. Automatic call checks and the Top eligible highlight are paused; fresh daily-change grouping and manual call panels remain available.");
+    if(market.open && rowData.length && priceFreshCount<rowData.length)notices.push(`${rowData.length-priceFreshCount} stocks are waiting for a fresh or usable Groww price. Last verified values are kept, but their live momentum and call eligibility are paused. Use All monitored to keep these rows visible.`);
+    if(state.samplingCooldown?.until>now)notices.push(`${state.samplingCooldown.label || "Groww rate limit"}. Stock sampling resumes after ${clockText(state.samplingCooldown.until)} IST.`);
     if (state.resultsUnavailableCount) notices.push(`Results check unavailable. ${state.resultsUnavailableCount} stocks withheld until valid coverage is available today.`);
     if (state.calendarError) notices.push(`Calendar refresh: ${state.calendarError}${state.calendar?.day===istDay(now)?". Using the last successful scan from today.":""}`);
     if (this.uiError) notices.push(this.uiError);
     if (this.diagnosticError || state.diagnosticError)notices.push(`Diagnostic archive: ${this.diagnosticError || state.diagnosticError}. Price monitoring continues.`);
+    const dataPrepared=timing();
     const intro=`<div class="bar"><div class="identity"><span class="mark" aria-hidden="true">↗</span><div><div class="brand">Strategy view</div><div class="small">F&O research companion</div></div></div><div class="toggle" role="group" aria-label="Page view"><button data-action="mode" data-mode="groww" aria-pressed="${this.settings.mode==="groww"}">Groww</button><button data-action="mode" data-mode="strategy" aria-pressed="${this.settings.mode==="strategy"}">Strategy view</button></div></div>`;
-    if (this.settings.mode==="groww") {this.commitHTML(`<style>${STYLE}</style>${intro}<p class="inactive">Strategy collection paused. Switch back to resume; missing history warms up again.</p>`);return;}
+    if (this.settings.mode==="groww") {this.commitHTML(`<style>${STYLE}</style>${intro}<p class="inactive">Strategy collection paused. Switch back to resume; missing history warms up again.</p>`);this.renderTime=null;return;}
     const html=`<style>${STYLE}</style>${intro}<section class="panel" aria-label="Strategy dashboard">
-      <div class="intro"><div><h2>One-minute spike scanner</h2><p class="small">Day > +${this.settings.minDay}% first · largest current 1m rise first</p><p class="small">Groww’s 15-minute gainers · stock name → stock page · row → calls here</p></div><div class="status"><span class="dot ${market.open&&fresh&&this.collector?"live":""}"></span>${escapeHTML(status)}<br>Last successful update ${clockText(state.updatedAt)} IST</div></div>
-      <div class="stats"><div class="stat"><strong>${rowData.length}</strong><span>Stocks monitored · ${state.membershipCount ?? rowData.length} in Groww feed</span></div><div class="stat"><strong>${state.resultsExcludedCount || 0}</strong><span>Hidden · results window</span></div><div class="stat"><strong>${stockPassed}</strong><span>Pass daily + fresh-price checks</span></div><div class="stat"><strong class="positive">${tagTotal}</strong><span>Confirmed strong bursts · last 15m</span></div><div class="stat"><strong>${rowData.filter(x=>x.check.pass&&x.option.pass&&fresh).length}</strong><span>With qualifying calls now</span></div></div>
-      <div class="toolbar"><div class="toolbar-group"><label class="check"><input type="checkbox" name="eligibleOnly" ${this.settings.eligibleOnly?"checked":""}>Eligible only</label>${pill(`Day > +${this.settings.minDay}%`,"",`The stock must currently be strictly above +${this.settings.minDay}% versus its previous close. A 15-minute gainer can still be negative for the day. Equality does not pass.`)}${pill(`Calls ${this.settings.nearTarget?"around":"above"} ${this.settings.minDistance}%`,"",this.distanceInfo())}${pill("Priority order","",{paragraphs:["Stocks with results from the previous NSE trading session through the next, inclusive, are completely hidden. Missing same-day calendar coverage also withholds stocks. Eligible only cannot override this rule.",`Fresh stock quotes with daily gain strictly above +${this.settings.minDay}% come first. Within each group, valid current one-minute returns sort from largest to smallest immediately, then newest source quote and original Groww rank. Unavailable windows appear last.`,"Every positive one-minute return is visible, even below 1%. Confirmation, historical burst count, five-minute return, recent peak and option IV never boost the order.","At ≥1%/1m the strong-rise badge starts amber. Another qualifying quote 10–30 seconds later confirms persistence in green. It does not independently verify the price or predict reversal. Fresh qualifying calls are required separately for the Top eligible highlight."]})}</div><div class="toolbar-group"><button class="btn" data-action="export-diagnostics" ${this.exporting?"disabled":""}>${this.exporting?"Exporting…":"Export diagnostics"}</button><button class="btn" data-action="calendar">Refresh calendar</button><button class="btn" data-action="refresh">Refresh prices</button><button class="btn" data-action="settings" aria-expanded="${this.settingsOpen}">Thresholds</button></div></div>
+      <div class="intro"><div><h2>One-minute spike scanner</h2><p class="small">Day > +${this.settings.minDay}% first · largest current 1m rise first</p><p class="small">Groww’s 15-minute gainers · stock name → stock page · row → calls here</p></div><div class="status" data-ui-key="monitor-status"><div class="monitor-heading"><span class="dot ${monitoring.live?"live":""}"></span><strong>${escapeHTML(status)}</strong></div><div>${escapeHTML(monitoring.detail)}</div><div class="small">Batch received ${clockText(state.updatedAt)} IST${state.membershipUpdatedAt?` · list verified ${Math.max(0,Math.floor((now-state.membershipUpdatedAt)/1000))}s ago`:""}</div><span class="background-note">Tab switching keeps monitoring enabled · browser sleep can interrupt it</span></div></div>
+      ${this.pipelineHTML(flow,state,view)}
+      <div class="toolbar"><div class="toolbar-group"><span class="view-label">View: <strong>${{all:"All monitored",stock:"Stock eligible",rising:"Rising now",calls:"Calls ready"}[view]}</strong></span>${pill(`Day > +${this.settings.minDay}%`,"",`The stock must currently be strictly above +${this.settings.minDay}% versus its previous close. A 15-minute gainer can still be negative for the day. Equality does not pass.`)}${pill(`Calls ${this.settings.nearTarget?"around":"above"} ${this.settings.minDistance}%`,"",this.distanceInfo())}${pill("Priority order","",{paragraphs:["Stocks with results from the previous NSE trading session through the next, inclusive, are completely hidden. Missing same-day calendar coverage also withholds stocks. No view can override this rule.",`Fresh stock quotes with daily gain strictly above +${this.settings.minDay}% come first. Within each group, valid current one-minute returns sort from largest to smallest immediately, then newest source quote and original Groww rank. Unavailable windows appear last.`,"Every positive one-minute return is visible, even below 1%. Confirmation, historical burst count, five-minute return, recent peak and option IV never boost the order.","At ≥1%/1m the strong-rise badge starts amber. Another qualifying quote 10–30 seconds later confirms persistence in green. It does not independently verify the price or predict reversal. The highlighted row must also have a positive current one-minute return and a fresh qualifying call. Stock eligibility alone does not mean it is rising now."]})}</div><div class="toolbar-group"><button class="btn" data-action="export-diagnostics" ${this.exporting?"disabled":""}>${this.exporting?"Exporting…":"Export diagnostics"}</button><button class="btn" data-action="calendar">Refresh calendar</button><button class="btn" data-action="refresh">Refresh prices</button><button class="btn" data-action="settings" aria-expanded="${this.settingsOpen}">Thresholds</button></div></div>
       ${this.diagnosticDownload?`<div class="export-ready"><a class="btn" href="${escapeHTML(this.diagnosticDownload.url)}" download="${escapeHTML(this.diagnosticDownload.filename)}">Download diagnostic archive (.jsonl)</a><span class="small">Public observations and review summary · saved locally</span></div>`:""}
-      <div class="coverage-line small">${rowData.filter(x=>x.spikes.confirmed).length} confirmed active · ${rowData.filter(x=>x.spikes.verifying).length} verifying · ${rowData.filter(x=>!x.spikes.coverage.valid).length} without fresh history · ${rowData.reduce((n,x)=>n+x.spikes.coverage.interruptions,0)} source gaps this session. New entrants warm from first observation; earlier moves are unseen.</div>
+      <div class="data-health"><span><strong>${priceFreshCount}</strong> fresh prices · <strong>${rowData.length-priceFreshCount}</strong> waiting for price</span><span><strong>${readyCount}</strong> ready 1m comparisons · <strong>${rowData.length-readyCount}</strong> building or waiting</span></div>
+      <details class="data-details" data-ui-key="data-details"><summary>Why a stock is waiting · data details</summary><ul><li><strong>Waiting for fresh price:</strong> the source quote is over 30 seconds old. The displayed price is retained; it cannot create a new signal.</li><li><strong>Building first minute:</strong> the stock has just entered monitoring. At least 60 seconds of observations are needed.</li><li><strong>Rebuilding 1m history:</strong> a source gap exceeded 30 seconds. A continuous minute is collected again.</li><li><strong>Waiting for comparison:</strong> no real sample is close enough to the 60-second comparison point. No prices are invented.</li><li><strong>Rechecking quote:</strong> source values conflicted. Waiting for a newer valid quote.</li></ul><p>${rowData.reduce((n,x)=>n+x.spikes.coverage.interruptions,0)} source gaps this session · ${tagTotal} confirmed strong bursts in the last 15m. These totals do not affect priority. Every positive current 1m return can rank, even below 1%.</p>${state.error?`<p>Latest request detail: ${escapeHTML(state.error)}</p>`:""}</details>
+      ${this.filterMigrationNotice?'<div class="notice">Eligible only has been replaced by the stages above. Starting in All monitored keeps the watchlist visible while quotes or calls refresh.</div>':""}
+      ${view!=="all"?`<div class="filter-summary">Showing ${visible.length} of ${flow.all.length} monitored stocks in <strong>${{stock:"Stock eligible",rising:"Rising now",calls:"Calls ready"}[view]}</strong>. Waiting stocks are hidden by this selected stage.<button class="btn" data-action="scanner-view" data-view="all">Show all monitored</button></div>`:""}
       ${this.settingsOpen?this.settingsHTML():""}
       ${notices.map(text=>`<div class="notice" role="status">${escapeHTML(text)}</div>`).join("")}
-      ${leader?`<div class="note">Highest-ranked eligible stock: <strong>${escapeHTML(leader.stock.name)}</strong> · passes the configured checks; reversal assessment remains manual.</div>`:""}
-      ${!state.updatedAt&&!state.error?'<div class="loading" role="status">Loading the public gainers feed and results calendar…</div>':`<div class="table-scroll" id="strategy-table-scroll" role="region" aria-label="Scrollable strategy table" tabindex="0"><table aria-label="One-minute rises among 15-minute gainers"><thead><tr><th>Stock / Groww rank</th><th>Rise in ~1m</th><th class="num">Price · NSE</th><th class="num">Day change · NSE</th><th>Day + results checks</th><th>Call options</th></tr></thead><tbody>${visible.length?visible.map(row=>this.rowHTML(row,leader?.stock.symbol,market,fresh)).join(""):`<tr><td colspan="6"><div class="empty"><strong>${state.resultsUnavailableCount?"Results check unavailable":this.settings.eligibleOnly?"No eligible stocks right now":"No allowed stocks returned"}</strong>${this.settings.eligibleOnly?"Turn off Eligible only to inspect allowed stocks and unchecked options.":"Refresh the calendar or check the source status above."}</div></td></tr>`}</tbody></table></div>`}
-      <div class="note">Click any tag for its explanation. Amber means verifying; green means observed persistence across fresh quotes. Current momentum and historical peaks are shown separately. One continuous burst counts once.</div>
+      ${leader?`<div class="note">Highest current rise with calls ready: <strong>${escapeHTML(leader.stock.name)}</strong> · rising now, stock checks passed and fresh qualifying call quotes. Reversal assessment remains manual.</div>`:""}
+      ${!state.updatedAt&&!state.error?'<div class="loading" role="status">Loading the public gainers feed and results calendar…</div>':`<div class="table-scroll" id="strategy-table-scroll" role="region" aria-label="Scrollable strategy table" tabindex="0"><table aria-label="One-minute rises among 15-minute gainers"><thead><tr><th>Stock / Groww rank</th><th>Rise in ~1m</th><th class="num">Price · NSE</th><th class="num">Day change · NSE</th><th>Day + results checks</th><th>Call options</th></tr></thead><tbody data-ui-list="stocks">${visible.length?"":`<tr><td colspan="6">${this.scannerEmptyHTML(flow,state,view)}</td></tr>`}</tbody></table></div>`}
+      <div class="note">Current one-minute returns set priority. Waiting rows keep their last verified prices; historical peaks are context only. Click any tag for its calculation and source times.</div>
       <div class="footer"><span>Calendar ${state.calendar?.fetchedAt?`checked ${escapeHTML(dateTimeText(state.calendar.fetchedAt))}`:"not verified"}${state.window?` · ${escapeHTML(state.window.from)} to ${escapeHTML(state.window.to)}`:""}</span><span>Strong-rise badge: ≥1% / 1m (provisional) · no minimum rise to rank · 10s sampling target · upstream quotes may lag</span></div>
     </section>${selected?this.optionsPanelHTML(selected,market,fresh):""}${this.explanation?this.explanationHTML():""}`;
-    if (!this.commitHTML(html))return;
-    const body=this.root.querySelector(".calls-body");if(body)body.scrollTop=callScroll;
-    const table=this.root.getElementById("strategy-table-scroll");if(table)table.scrollLeft=tableScroll;
-    for(const el of this.root.querySelectorAll("details[data-strike]"))if(openDetails.includes(el.dataset.strike))el.open=true;
-    for(const el of this.root.querySelectorAll("details[data-patterns]"))if(openPatterns.includes(el.dataset.patterns))el.open=true;
+    this.pendingRows=visible.map(row=>this.prepareRow(row,leader?.stock.symbol,market,fresh));
+    const prepared=timing(),changed=this.commitHTML(html),committed=timing();
+    this.lastRenderMetrics={stocks:visible.length,prepareMs:prepared-started,dataMs:dataPrepared-started,markupMs:prepared-dataPrepared,commitMs:committed-prepared,...this.lastCommitMetrics,totalMs:committed-started,changed,at:now};
+    const finishMetrics=()=>{
+      this.renderTime=null;this.lastRenderMetrics.totalMs=timing()-started;
+      if(location.hostname==="127.0.0.1" && this.host) {
+        const batchAt=state.updatedAt || 0,freshUpdate=batchAt>0 && batchAt!==this.renderedQuoteBatchAt;
+        this.renderedQuoteBatchAt=batchAt;
+        const record={...this.lastRenderMetrics,quoteBatchAt:batchAt,freshUpdate,sourceAt:Math.max(0,...(state.stocks || []).map(stock=>stock.quoteAt || 0))};
+        this.renderHistory.push(record);if(this.renderHistory.length>100)this.renderHistory.shift();
+        this.host.dataset.renderMetrics=JSON.stringify(record);this.host.dataset.renderHistory=JSON.stringify(this.renderHistory);
+        if(freshUpdate && typeof requestAnimationFrame==="function")requestAnimationFrame(()=>{
+          record.paintLatencyMs=Date.now()-(state.processedAt || batchAt);
+          if(this.host){this.host.dataset.renderHistory=JSON.stringify(this.renderHistory);this.host.dataset.paintMetrics=JSON.stringify({batchAt,latencyMs:record.paintLatencyMs});}
+        });
+      }
+    };
+    if(!changed){finishMetrics();return;}
+    const body=this.root.querySelector(".calls-body");if(body && (body!==priorCallBody || body.scrollTop!==callScroll))body.scrollTop=callScroll;
+    const table=this.root.getElementById("strategy-table-scroll");if(table && table!==priorTable)table.scrollLeft=tableScroll;
+    if(openDetails.length)for(const el of this.root.querySelectorAll("details[data-strike]"))if(openDetails.includes(el.dataset.strike))el.open=true;
+    if(openPatterns.length)for(const el of this.root.querySelectorAll("details[data-patterns]"))if(openPatterns.includes(el.dataset.patterns))el.open=true;
     if (this.explanation) this.root.querySelector("dialog")?.showModal();
-    else if(focusId)this.root.getElementById(focusId)?.focus({preventScroll:true});
-    else if(focusLabel)[...this.root.querySelectorAll("button[aria-label],select[aria-label],a[aria-label],tr[aria-label]")].find(el=>el.getAttribute("aria-label")===focusLabel)?.focus({preventScroll:true});
+    else if(focusedNode!==this.root.activeElement || !focusedNode?.isConnected) {
+      if(focusId)this.root.getElementById(focusId)?.focus({preventScroll:true});
+      else if(focusLabel)[...this.root.querySelectorAll("button[aria-label],select[aria-label],a[aria-label],tr[aria-label]")].find(el=>el.getAttribute("aria-label")===focusLabel)?.focus({preventScroll:true});
+    }
+    finishMetrics();
   }
   commitHTML(html) {
-    if (this.renderedRoot===this.root && this.renderedHTML===html)return false;
-    this.root.innerHTML=html;this.renderedRoot=this.root;this.renderedHTML=html;return true;
+    const timing=typeof performance!=="undefined"?()=>performance.now():()=>Date.now(),started=timing();
+    let changed=false;
+    if(this.renderedRoot!==this.root || this.renderedHTML!==html) {
+      if(this.renderedRoot!==this.root) {this.root.innerHTML=html;this.rowDOMCache=new Map();this.emptyRowsHTML=this.root.querySelector('tbody[data-ui-list="stocks"]')?.innerHTML || "";}
+      else {
+        const template=document.createElement("template");template.innerHTML=html;
+        this.emptyRowsHTML=template.content.querySelector('tbody[data-ui-list="stocks"]')?.innerHTML || "";
+        patchDOMChildren(this.root,template.content);
+      }
+      this.renderedRoot=this.root;this.renderedHTML=html;changed=true;
+    }
+    const shellDone=timing(),body=this.root.querySelector('tbody[data-ui-list="stocks"]');
+    if(body)changed=this.reconcileRows(body) || changed;
+    this.lastCommitMetrics={shellMs:shellDone-started,rowsMs:timing()-shellDone,...this.lastRowMetrics};
+    return changed;
+  }
+  prepareRow(row,leader,market,fresh) {
+    const {stock,spikes,check,option}=row,snapshot=this.getOptions(stock);
+    const signature=JSON.stringify([stock.name,stock.searchId,stock.rank,stock.spot,stock.dayPct,stock.quoteAt,stock.priceError,stock.quoteWarning,stock.quoteConflictAt,quoteFresh(stock,Date.now()),
+      this.settings.minDay,this.settings.minDistance,this.settings.nearTarget,leader===stock.symbol,this.selectedSymbol===stock.symbol,market.open,fresh,
+      check.pass,check.reasons,check.results.label,option.pass,option.label,snapshot?.expiry,snapshot?.loading,snapshot?.error,snapshot?.state,
+      spikes.one,spikes.five,spikes.fifteen,spikes.latestChange,spikes.peakOne,spikes.status,spikes.confirmed,spikes.verifying,spikes.patterns,
+      spikes.events.map(e=>[e.id,e.one,e.five,e.firstSeen])]);
+    let cached=this.rowHTMLCache.get(stock.symbol);
+    if(cached?.signature!==signature) {
+      const html=this.rowHTML(row,leader,market,fresh);
+      cached={symbol:stock.symbol,signature,html,cells:html.match(/<td\b[\s\S]*?<\/td>/g) || []};
+      this.rowHTMLCache.set(stock.symbol,cached);
+    }
+    return cached;
+  }
+  reconcileRows(body) {
+    const timing=typeof performance!=="undefined"?()=>performance.now():()=>Date.now();
+    const metrics={updatedRows:0,updatedCells:0,textPatchedCells:0,insertedRows:0,movedRows:0,cellParseMs:0,cellPatchMs:0};this.lastRowMetrics=metrics;
+    this.rowDOMCache ||= new Map();
+    const wanted=new Set(this.pendingRows.map(row=>row.symbol));
+    let changed=false,cursor=body.firstChild;
+    if(!this.pendingRows.length) {
+      const html=this.emptyRowsHTML || "";
+      if(body.innerHTML!==html){body.innerHTML=html;changed=true;}
+      this.rowDOMCache.clear();return changed;
+    }
+    let rows=this.pendingRows;
+    if(this.rowInteractionUntil>Date.now()) {
+      const bySymbol=new Map(rows.map(row=>[row.symbol,row]));
+      const existing=[...body.children].map(node=>bySymbol.get(node.dataset.symbol)).filter(Boolean);
+      const mounted=new Set(existing.map(row=>row.symbol));rows=[...existing,...rows.filter(row=>!mounted.has(row.symbol))];
+      clearTimeout(this.rowOrderTimer);
+      this.rowOrderTimer=setTimeout(()=>{this.rowOrderTimer=null;this.render();},Math.max(1,this.rowInteractionUntil-Date.now()+1));
+    }
+    for(const row of rows) {
+      let cached=this.rowDOMCache.get(row.symbol),node=cached?.node;
+      if(!node || node.parentNode!==body) {
+        const start=timing();
+        const table=document.createElement("table");table.innerHTML=`<tbody>${row.html}</tbody>`;node=table.firstElementChild.firstElementChild;
+        metrics.cellParseMs+=timing()-start;metrics.insertedRows++;
+        cached={node,cells:row.cells,signature:row.signature};this.rowDOMCache.set(row.symbol,cached);changed=true;
+      } else if(cached.signature!==row.signature) {
+        metrics.updatedRows++;
+        for(let i=0;i<row.cells.length;i++)if(cached.cells[i]!==row.cells[i]) {
+          const start=timing();
+          if(patchCellText(node.children[i],cached.cells[i],row.cells[i])) {
+            metrics.cellPatchMs+=timing()-start;metrics.updatedCells++;metrics.textPatchedCells++;continue;
+          }
+          const table=document.createElement("table");table.innerHTML=`<tbody><tr>${row.cells[i]}</tr></tbody>`;
+          const parsed=timing();metrics.cellParseMs+=parsed-start;
+          patchDOMNode(node.children[i],table.firstElementChild.firstElementChild.firstElementChild);
+          metrics.cellPatchMs+=timing()-parsed;metrics.updatedCells++;
+        }
+        const selected=this.selectedSymbol===row.symbol;
+        node.classList.toggle("selected",selected);node.classList.toggle("candidate",row.html.includes('class="stock-row candidate'));
+        node.setAttribute("aria-expanded",String(selected));cached.cells=row.cells;cached.signature=row.signature;changed=true;
+      }
+      if(node!==cursor){body.insertBefore(node,cursor);metrics.movedRows++;changed=true;}else cursor=cursor.nextSibling;
+    }
+    for(const node of [...body.children])if(!wanted.has(node.dataset.symbol)){node.remove();changed=true;}
+    for(const symbol of this.rowDOMCache.keys())if(!wanted.has(symbol))this.rowDOMCache.delete(symbol);
+    for(const symbol of this.rowHTMLCache.keys())if(!wanted.has(symbol))this.rowHTMLCache.delete(symbol);
+    return changed;
   }
   explanationHTML() {
     const info=this.explanation;
@@ -1367,7 +1824,10 @@ class StrategyApp {
     return `<form id="threshold-form" class="settings"><div class="settings-grid">${fields.map(([key,label])=>`<label>${label}<input name="${key}" aria-label="${label}" type="number" min="0" max="100" step="0.01" required value="${this.settings[key]}"></label>`).join("")}<button class="btn primary" type="submit">Apply thresholds</button></div><label class="check near-setting"><input type="checkbox" name="nearTarget" ${this.settings.nearTarget?"checked":""}>Include one near-target call (strictly above ${nearTargetFloor(this.settings)}%)</label><p class="small" style="margin-top:10px">The main distance rule is strike &gt; spot × (1 + target%). The optional exception chooses one nearest strike at/below target, preferring an exact target; otherwise it must be within 0.5 percentage points below target. At 10%, the floor is strictly &gt;9.5%. Calls then continue in listed strike order. This is strike distance, not premium or profit. Liquidity uses Groww’s crossed-droplet flag only; OI, volume, spread and depth are informational.</p></form>`;
   }
   windowDetails(label,change) {
-    return change?.ready ? [[label,percent(change.pct)],["Observed interval",`${change.seconds}s`],["Start",`${money(change.startPrice)} · ${dateTimeText(change.startAt)}`],["End",`${money(change.endPrice)} · ${dateTimeText(change.endAt)}`]] : [[label,"Warming up or unavailable"]];
+    return change?.ready ? [[label,percent(change.pct)],["Observed interval",`${change.seconds}s`],...(Number.isFinite(change.anchorOffsetSeconds)?[["Anchor offset from 60s",`${change.anchorOffsetSeconds}s`]]:[]),["Start",`${money(change.startPrice)} · ${dateTimeText(change.startAt)}`],["End",`${money(change.endPrice)} · ${dateTimeText(change.endAt)}`]] : [[label,this.coverageLabel(change?.reason).replace(/^1m /,`${label.match(/\b(?:15m|5m|1m)\b/)?.[0] || "History"} `)]];
+  }
+  coverageLabel(reason) {
+    return ({"warming":"1m warming up","warming-up":"1m warming up","insufficient-history":"1m warming up","stale-quote":"Quote stale","stale":"Quote stale","source-gap":"Coverage interrupted","gap":"Coverage interrupted","missing-anchor":"No sample near 60s","no-anchor":"No sample near 60s","unusable-quote":"Quote unavailable","unavailable":"Quote unavailable","inconsistent":"Observation rejected"})[reason] || "Warming up or unavailable";
   }
   burstInfo(stock,events,event=null) {
     const chosen=event?[event]:[...events].reverse();
@@ -1377,7 +1837,7 @@ class StrategyApp {
   }
   momentumInfo(stock,spikes,label="Current momentum") {
     const definitions={"Fast rise":"Current one-minute return is at least 1%.","Strong five-minute rise":"Current five-minute return is at least 2%.","Accelerating":"Three consecutive non-overlapping one-minute returns are positive and strictly increasing, using shared boundary samples.","Repeated surges":"At least two distinct confirmed bursts remain within 15 minutes of their last threshold hits.","New 15-minute high":"Current sampled price strictly exceeds every earlier sampled price in a fully covered preceding 15-minute window. This is a sampled high, not every exchange trade.","Cooling":"A confirmed recent burst remains, but the current one-minute return is zero or negative."};
-    return {title:`${stock.symbol} · ${label}`,paragraphs:[definitions[label] || "Current one-minute rise = (latest price ÷ sampled price approximately 60 seconds earlier − 1) × 100. All positive returns are visible and rank immediately. At ≥1%, the strong-rise badge is amber; another qualifying quote 10–30 seconds later without an observed failure confirms persistence in green.","Returns use actual Groww source times. A complete window, an anchor within 10 seconds of its beginning and no source gap over 30 seconds are required. No interpolation, overnight gaps or pre-monitoring history is used. The latest sample change and highest one-minute reading observed in the last 60 seconds are secondary context only.","Confirmation, five-minute context, historical bursts, recent peaks and option IV never change the one-minute ranking. The strong-rise threshold is provisional and does not predict reversal."],
+    return {title:`${stock.symbol} · ${label}`,paragraphs:[definitions[label] || "Current one-minute rise = (latest price ÷ sampled price approximately 60 seconds earlier − 1) × 100. All positive returns are visible and rank immediately. At ≥1%, the strong-rise badge is amber; another qualifying quote 10–30 seconds later without an observed failure confirms persistence in green.","Returns use actual Groww source times. After at least 60 seconds of history, choose the real sample closest to 60 seconds earlier within ±10 seconds; ties use the older sample. The actual interval is 50–70 seconds and no source gap may exceed 30 seconds. No interpolation, overnight gaps or pre-monitoring history is used. The latest sample change and highest one-minute reading observed in the last 60 seconds are secondary context only.","Confirmation, five-minute context, historical bursts, recent peaks and option IV never change the one-minute ranking. The strong-rise threshold is provisional and does not predict reversal."],
       details:[["Status",spikes.status],...this.windowDetails("Current 1m",spikes.one),...this.windowDetails("Latest sample change",spikes.latestChange),...this.windowDetails("Highest 1m reading in last 60s",spikes.peakOne),["Peak reading observed",dateTimeText(spikes.peakOne?.observedAt)],...this.windowDetails("Current 5m",spikes.five),...this.windowDetails("Current 15m",spikes.fifteen),
       ...spikes.acceleration.returns.flatMap((r,i)=>this.windowDetails(`Acceleration minute ${i+1} (oldest first)`,r)),["First active hit",dateTimeText(spikes.confirmation?.firstSeen)],["Current run confirmed",dateTimeText(spikes.confirmation?.confirmedAt)],["History began / resumed",dateTimeText(spikes.coverage.since)],["Source gaps",String(spikes.coverage.interruptions)],...(spikes.coverage.lastGap?[["Latest source gap",`${spikes.coverage.lastGap.seconds}s · ${dateTimeText(spikes.coverage.lastGap.from)} to ${dateTimeText(spikes.coverage.lastGap.to)}`]]:[])]};
   }
@@ -1385,6 +1845,7 @@ class StrategyApp {
     const state=this.snapshot, result=label.startsWith("Results ");
     const paragraphs=result ? [check.results.unknown ? "The results check is unavailable because there is no valid scan covering the required dates today. This stock is excluded until coverage is verified. Use Refresh calendar to retry." : "Groww lists financial results inside the exclusion window. This stock remains excluded, regardless of its spike tags. The window includes every calendar date from the previous NSE trading session through the next session, including intervening holidays and weekends."] :
       [label==="Stock checks passed" ? `The daily change is strictly above +${this.settings.minDay}%, the stock price is valid, and today’s Groww calendar scan lists no results in the exclusion window. Fresh price samples and liquid call quotes are required separately for full eligibility.` :
+      label==="Gainers membership stale" ? "Groww’s gainers list has not been successfully verified for at least five minutes. Fresh stock quotes continue to update, but automatic call checks and the eligible highlight wait for membership to be verified again." :
       label==="Price unavailable" || label.includes("Groww") || label.includes("quote") ? "The timestamped Groww NSE stock quote is missing, inconsistent or older than 30 seconds. This row cannot qualify or create new spikes until a fresh quote arrives. Price and daily change use the same Groww LTP and previous close; the cached gainers price is never substituted." : `Daily change is measured against the previous close. The current gain must be strictly above +${this.settings.minDay}%; a short upward burst alone does not pass this rule. This label describes the current observation, not every earlier moment in the day.`];
     return {title:`${stock.symbol} · ${label}`,paragraphs,details:[["Daily change now",percent(stock.dayPct)],["Previous close · Groww",money(stock.previousClose)],["Groww source quote",dateTimeText(stock.quoteAt)],["Quote fetched",dateTimeText(state.updatedAt)],["Price source","Groww NSE CASH quote; ranking feed is candidate selection only"],["Results source","Groww results calendar"],["Results scan",dateTimeText(state.calendar?.fetchedAt)],["Covered dates",state.window?`${state.window.from} through ${state.window.to}`:"Unavailable"],...(check.results.events || []).map(e=>["Results date",e.date])]};
   }
@@ -1410,30 +1871,41 @@ class StrategyApp {
   stockURL(stock) {return `https://groww.in/stocks/${encodeURIComponent(stock.searchId)}`;}
   rowHTML({stock,spikes,check,option},leader,market,fresh) {
     const expanded=this.selectedSymbol===stock.symbol, snapshot=this.getOptions(stock);
+    const priceFresh=quoteFresh(stock,Date.now());
     const events=[...spikes.events].reverse();
     const patternLabels=[["fast","Fast rise"],["strongFive","Strong five-minute rise"],["accelerating","Accelerating"],["repeated","Repeated surges"],["newHigh","New 15-minute high"],["cooling","Cooling"]].filter(([key,label])=>spikes.patterns[key] && label!==spikes.status);
-    const patternHTML=([key,label])=>pill(label,key==="cooling"?"amber":spikes.confirmed?"green":"",this.momentumInfo(stock,spikes,label));
+    const patternHTML=([key,label])=>pill(label,key==="cooling"?"amber":spikes.confirmed?"green":"",this.lazyInfo("momentum",stock,label));
     const tags=patternLabels.slice(0,2).map(patternHTML).join("");
-    const history=events.map(e=>tagButton(`Peak ${e.one!==null?`${percent(e.one)} / 1m`:""}${e.one!==null&&e.five!==null?" · ":""}${e.five!==null?`${percent(e.five)} / 5m`:""}<time>${clockText(e.firstSeen)}</time>`,this.burstInfo(stock,events,e),"spike-tag")).join("");
+    const history=events.map(e=>tagButton(`Peak ${e.one!==null?`${percent(e.one)} / 1m`:""}${e.one!==null&&e.five!==null?" · ":""}${e.five!==null?`${percent(e.five)} / 5m`:""}<time>${clockText(e.firstSeen)}</time>`,this.lazyInfo("burst",stock,"Historical burst peaks",e.id),"spike-tag")).join("");
     const context=[['5m',spikes.five],['15m',spikes.fifteen]].map(([label,r])=>r.ready?`${label} ${percent(r.pct)} (${r.seconds}s)`:`${label} ${market.open?"warming up":"unavailable"}`).join(" · ");
     const secondary=[spikes.latestChange?.ready?`Last ${spikes.latestChange.seconds}s: ${percent(spikes.latestChange.pct)} · ${clockText(spikes.latestChange.endAt)}`:"",spikes.peakOne?.ready?`1m high in last 60s: ${riseText(spikes.peakOne.pct)} · ${clockText(spikes.peakOne.observedAt)}`:""].filter(Boolean);
-    const tone=spikes.confirmed?"green":spikes.verifying || spikes.patterns.cooling?"amber":"";
-    return `<tr class="stock-row ${leader===stock.symbol?"candidate":""} ${expanded?"selected":""}" data-action="open-calls" data-symbol="${escapeHTML(stock.symbol)}" tabindex="0" aria-label="View ${escapeHTML(stock.symbol)} calls" aria-expanded="${expanded}" aria-controls="calls-drawer"><td class="stock-cell">${stock.searchId?`<a class="stock-name stock-open" href="${this.stockURL(stock)}" target="_blank" rel="noopener noreferrer" aria-label="Open ${escapeHTML(stock.symbol)} stock page" title="Open Groww stock page">${escapeHTML(stock.name)}</a>`:`<span class="stock-name">${escapeHTML(stock.name)}</span>`}<div class="stock-meta"><span class="rank">#${stock.rank}</span>${escapeHTML(stock.symbol)}${leader===stock.symbol?" · Top eligible":""}</div></td>
-      <td class="spikes">${tagButton(spikes.one.ready?escapeHTML(riseText(spikes.one.pct)):market.open?"1m warming up":"1m unavailable",this.momentumInfo(stock,spikes,"Rise in ~1m"),`rise-value ${spikes.one.ready&&spikes.one.pct>0?"positive":""}`)}<div class="small">${spikes.one.ready?`${spikes.one.seconds}s observed · ${clockText(spikes.one.endAt)} IST`:"Complete source history required"}</div><div class="tags">${pill(spikes.status,tone,this.momentumInfo(stock,spikes,spikes.status))}</div>
+    const presentation=momentumPresentation(stock,spikes,Date.now(),market);
+    const shownReasons=new Set();
+    const checksHTML=check.reasons.map(reason=>{
+      const priceReason=reason===stock.priceError || reason==="Groww quote stale or unavailable" || reason==="Price unavailable";
+      const label=priceReason?(stock.quoteConflictAt?"Rechecking quote":"Waiting for price"):reason;
+      if(shownReasons.has(label))return "";shownReasons.add(label);
+      return `<div class="reason">${pill(label,label==="Negative today"||label.startsWith("Results ")&&!check.results.unknown?"red":"amber",this.lazyInfo("check",stock,reason))}</div>`;
+    }).join("");
+    return `<tr class="stock-row ${leader===stock.symbol?"candidate":""} ${expanded?"selected":""}" data-action="open-calls" data-symbol="${escapeHTML(stock.symbol)}" tabindex="0" aria-label="View ${escapeHTML(stock.symbol)} calls" aria-expanded="${expanded}" aria-controls="calls-drawer"><td class="stock-cell">${stock.searchId?`<a class="stock-name stock-open" href="${this.stockURL(stock)}" target="_blank" rel="noopener noreferrer" aria-label="Open ${escapeHTML(stock.symbol)} stock page" title="Open Groww stock page">${escapeHTML(stock.name)}</a>`:`<span class="stock-name">${escapeHTML(stock.name)}</span>`}<div class="stock-meta"><span class="rank">#${stock.rank}</span>${escapeHTML(stock.symbol)}${leader===stock.symbol?" · Rising + calls ready":""}</div></td>
+      <td class="spikes">${tagButton(spikes.one.ready?escapeHTML(riseText(spikes.one.pct)):escapeHTML(presentation.label),this.lazyInfo("momentum",stock,"Rise in ~1m"),`rise-value ${spikes.one.ready&&spikes.one.pct>0?"positive":""} ${spikes.one.ready?"":"waiting-value"}`)}<div class="small waiting-detail">${escapeHTML(presentation.detail)}</div>${spikes.one.ready?`<div class="tags">${pill(presentation.label,presentation.tone,this.lazyInfo("momentum",stock,presentation.label))}</div>`:""}
       <div class="sample-context small">${secondary.map(text=>escapeHTML(text)).join("<br>")}</div><div class="tags pattern-tags">${tags}</div><details class="pattern-details" data-patterns="${escapeHTML(stock.symbol)}"><summary>5m / 15m context · ${events.length} confirmed strong burst${events.length===1?"":"s"}</summary><div class="current-returns small">${escapeHTML(context)}</div><div class="tags">${patternLabels.slice(2).map(patternHTML).join("")}${history}</div></details></td>
-      <td class="num price">${money(stock.spot)}<div class="small quote-stamp ${quoteFresh(stock,Date.now())?"":"negative"}">${stock.quoteAt?`Groww ${clockText(stock.quoteAt)}${quoteFresh(stock,Date.now())?"":" · stale"}`:"Quote unavailable"}</div></td><td class="num ${stock.dayPct>0?"positive":stock.dayPct<0?"negative":""}">${percent(stock.dayPct)}</td>
-      <td>${check.pass?pill("Stock checks passed","green",this.checkInfo(stock,check,"Stock checks passed")):check.reasons.map(text=>`<div class="reason">${pill(text,text==="Negative today"||text.startsWith("Results ")&&!check.results.unknown?"red":"amber",this.checkInfo(stock,check,text))}</div>`).join("")}${check.pass?`<div class="small">${escapeHTML(check.results.label)}</div>`:""}</td>
-      <td class="calls-cell">${stock.searchId?`<a class="btn ${option.pass&&check.pass&&fresh?"primary":""}" href="${this.optionURL(stock)}" target="_blank" rel="noopener noreferrer" aria-label="Open ${escapeHTML(stock.symbol)} option chain">Open chain ↗</a>`:"Chain unavailable"}<div class="small" style="margin-top:6px">${snapshot?.loading?"Checking quotes…":escapeHTML(snapshot?.error?"Options unavailable":option.label)}</div></td></tr>`;
+      <td class="num price">${money(stock.spot)}<div class="small quote-stamp ${priceFresh?"":"negative"}">${stock.quoteAt?`Groww ${clockText(stock.quoteAt)}${priceFresh?"":stock.priceError?" · unavailable":" · stale · last verified"}`:"Waiting for Groww price"}</div>${stock.quoteWarning?`<div class="small quote-warning">${escapeHTML(stock.quoteWarning)}</div>`:""}</td><td class="num ${stock.dayPct>0?"positive":stock.dayPct<0?"negative":""}">${percent(stock.dayPct)}</td>
+      <td>${check.pass?pill("Stock checks passed","green",this.lazyInfo("check",stock,"Stock checks passed")):checksHTML}${check.pass?`<div class="small">${escapeHTML(check.results.label)}</div>`:""}</td>
+      <td class="calls-cell">${stock.searchId?`<a class="btn ${option.pass&&check.pass&&fresh&&market.open&&spikes.one.ready&&spikes.one.pct>0?"primary":""}" href="${this.optionURL(stock)}" target="_blank" rel="noopener noreferrer" aria-label="Open ${escapeHTML(stock.symbol)} option chain">Open chain ↗</a>`:"Chain unavailable"}<div class="small" style="margin-top:6px">${snapshot?.loading?"Checking quotes…":escapeHTML(snapshot?.error?"Options unavailable":option.label)}</div></td></tr>`;
   }
-  optionsPanelHTML({stock,option:status,check},market,pricesFresh) {
+  optionsPanelHTML({stock,option:status,check,leftMembership=false},market,pricesFresh) {
     if(!resultsAllowed(stock,this.snapshot.calendar,this.snapshot.window,Date.now()))return "";
     const snapshot=this.getOptions(stock),expiry=this.selectedExpiries[stock.symbol] || snapshot?.expiry;
     const qualified=status.qualifying.filter(()=>check.pass&&pricesFresh),shown=status.items.slice(0,this.callLimit);
     const cutoff=snapshot?.spot>0?snapshot.spot*(1+this.settings.minDistance/100):null;
     let content;
-    if (!snapshot || snapshot.loading&&!snapshot.items) content='<div class="loading" role="status">Loading call prices and lot sizes…</div>';
+    const pending=snapshot?.state==="queued" || snapshot?.requestState==="queued";
+    const cooldown=snapshot?.state==="cooldown" || snapshot?.requestState==="cooldown";
+    if(cooldown)content=`<div class="notice" role="status">Call service cooldown${snapshot.retryAt?` · retry after ${clockText(snapshot.retryAt)} IST`:""}. ${escapeHTML(snapshot.error || "Waiting for Groww to permit another call quote request.")}</div>`;
+    else if (!snapshot || snapshot.loading&&!snapshot.items) content=`<div class="loading" role="status">${pending?"Call request queued · waiting for the quote slot…":"Loading call prices and lot sizes…"}${snapshot?.deadlineAt?`<div class="small">Response deadline ${clockText(snapshot.deadlineAt)} IST</div>`:""}</div>`;
     else if (snapshot.error) content=`<div class="notice error" role="status">${escapeHTML(snapshot.error)}. Call prices and potential profit are unavailable until quotes and lot sizes can be verified.</div>`;
-    else content=`<div class="call-source"><div>Groww · NSE stock + option quotes${snapshot.loading?" · refreshing…":""}</div>
+    else content=`<div class="call-source"><div>Groww · NSE stock + option quotes${snapshot.loading?pending?" · refresh queued…":" · refreshing…":""}</div>
       <div>Underlying quote ${escapeHTML(dateTimeText(snapshot.spotQuoteAt))} · contract metadata fetched ${escapeHTML(clockText(snapshot.growwFetchedAt))} IST</div>
       <div>Spot <strong>${money(snapshot.spot)}</strong> · +${this.settings.minDistance}% line <strong>${money(cutoff)}</strong>${this.settings.nearTarget?` · near-target floor &gt;${nearTargetFloor(this.settings)}%`:""}</div></div>
       <div class="call-state">${qualified.length?pill(`${qualified.length} qualifying call${qualified.length===1?"":"s"}`,"green",this.callInfo(stock)):pill("No qualifying calls","amber",this.callInfo(stock))}
@@ -1444,7 +1916,7 @@ class StrategyApp {
     return `<aside id="calls-drawer" class="calls-drawer" aria-label="${escapeHTML(stock.symbol)} call comparison" tabindex="-1">
       <div class="calls-head"><div><h2>${escapeHTML(stock.name)}</h2><p class="small">Call comparison · target +${this.settings.minDistance}%${this.settings.nearTarget?` · one near-target exception &gt;${nearTargetFloor(this.settings)}%`:""}</p></div><button class="btn" data-action="close-calls" aria-label="Close calls panel">✕</button></div>
       <div class="calls-body"><div class="call-controls">${snapshot?.expiries?`<label class="small">Expiry <select name="expiry" data-symbol="${escapeHTML(stock.symbol)}" aria-label="${escapeHTML(stock.symbol)} expiry">${snapshot.expiries.map(d=>`<option value="${d}" ${d===expiry?"selected":""}>${d}</option>`).join("")}</select></label>`:`<span class="small">${escapeHTML(expiry || "Nearest available monthly expiry")}</span>`}<button class="btn" data-action="options" data-symbol="${escapeHTML(stock.symbol)}">Refresh calls</button></div>
-      ${!market.open?`<p class="snapshot-notice">${escapeHTML(market.label)} · showing available snapshots for comparison.</p>`:""}${content}
+      ${leftMembership?'<p class="snapshot-notice">Left gainers list · this selected call panel continues updating. Automatic checks follow the current list.</p>':""}${!market.open?`<p class="snapshot-notice">${escapeHTML(market.label)} · showing available snapshots for comparison.</p>`:""}${content}
       <p class="payoff-note">Potential max profit = selling premium × lot size, assuming a fill at that price and expiry at or below the strike. Amounts are gross before costs. LTP is a reference, not an executable offer. An uncovered short call has unlimited potential loss; a 10% gap does not cap it.</p></div>
       <div class="calls-foot">${stock.searchId?`<a class="chain-link" href="${this.optionURL(stock)}" target="_blank" rel="noopener noreferrer" aria-label="Open ${escapeHTML(stock.symbol)} option chain on Groww">Open option chain on Groww ↗</a>`:"Option chain link unavailable"}<span class="small">Optional · opens in a new tab</span></div></aside>`;
   }
@@ -1478,143 +1950,383 @@ class StrategyApp {
         <div><dt>Groww call contract</dt><dd>${escapeHTML(item.contract || "Unavailable")}</dd></div><div><dt>Exchange token</dt><dd>${escapeHTML(item.token || "Unavailable")}</dd></div></dl>
       </details></article>`;
   }
-  stop() {this.alive=false;clearInterval(this.coordinatorTimer);this.releaseLock?.();this.restoreNative(false);}
+  stop() {this.alive=false;clearInterval(this.coordinatorTimer);clearTimeout(this.rowOrderTimer);
+    try{this.collector?.stop();}finally{this.releaseLock?.();this.restoreNative(false);}}
 }
 class Collector {
   constructor(app) {
-    this.app=app;this.running=false;this.busy=false;this.timer=null;this.seenCommands=new Set();this.pending=new Map();
-    this.optionGeneration=new Map();this.optionControllers=new Map();this.publishTail=Promise.resolve();
+    this.app=app;this.running=false;this.busy=false;this.starting=false;this.seenCommands=new Set();this.pending=new Map();
+    this.optionGeneration=new Map();this.optionControllers=new Map();this.selectedContexts=new Map();this.writes=new Map();
     this.providers=new Providers(new PublicTransport(details=>GM_xmlhttpRequest(details)),storage);
-    this.state={...app.snapshot,stocks:app.snapshot.stocks || [],options:{...(app.snapshot.options || {})},owner:app.id,pricingVersion:2};
-    this.engine=safeEngine(this.state.engine);this.nextCalendar=0;this.calendarBusy=false;
+    this.state={...app.snapshot,stocks:app.snapshot.stocks || [],options:{...(app.snapshot.optionSummaries || {}),...(app.snapshot.options || {})},
+      identities:{...(app.snapshot.identities || {})},signals:{},owner:app.id,ownerStartedAt:Date.now(),pricingVersion:2};
+    this.engine=safeEngine(this.state.engine);delete this.state.engine;
+    for(const stock of this.state.stocks)this.state.identities[stock.symbol]=stock;
+    this.membership=this.state.stocks;this.nextCalendar=0;this.nextMembership=0;this.calendarBusy=false;this.membershipBusy=false;
+    this.publishTail=Promise.resolve();this.revision=0;this.nextQuoteAt=0;this.nextAutoAt=0;
   }
   async start() {
-    this.running=true;
-    const cachedHolidays=await storage.get("holidays",null);
-    if (cachedHolidays && istDay(cachedHolidays.fetchedAt)===istDay(Date.now())) this.state.holidays=cachedHolidays;
-    this.refreshCalendar(false);await this.tick();
+    this.running=true;this.starting=true;
+    const [holidays,checkpoint]=await Promise.all([storage.get("holidays",null),storage.get("engineCheckpoint",null)]);
+    if(!this.running)return;
+    if(holidays && istDay(holidays.fetchedAt)===istDay(Date.now()))this.state.holidays=holidays;
+    const saved=checkpoint?.engine || checkpoint;
+    if(saved?.source===PRICE_SOURCE && (!this.engine.day || (checkpoint?.updatedAt || 0)>=(this.state.updatedAt || 0)))this.engine=safeEngine(saved);
+    for(const entry of Object.values(this.engine.states))if(entry.identity && !this.state.identities[entry.identity.symbol])this.state.identities[entry.identity.symbol]=entry.identity;
+    // Membership and calendar are startup prerequisites, but neither controls the quote timer after startup.
+    await Promise.allSettled([this.refreshMembership(false),this.refreshCalendar(false)]);
+    if(!this.running)return;
+    this.starting=false;this.enforceResults();
+    // The display rejection can reach another tab before its history checkpoint.
+    // A restored pending run must see that failure before any newer quote arrives.
+    const rejected=Object.values(this.state.identities).filter(stock=>stock.priceError && this.engine.states[stockKey(stock)]);
+    if(rejected.length){this.engine.observe(rejected,Date.now());this.checkpointDirty=true;}
+    await this.tick();
+    this.maintenanceTimer=setInterval(()=>this.maintain(),1000);
   }
-  stop() {this.running=false;clearTimeout(this.timer);this.providers.cancelAllOptions();for(const controller of this.optionControllers.values())controller.abort();this.app.archive.flush();}
+  stop({drainWrites=false}={}) {
+    try{if(this.running)this.flushRecord();else this.cancelRecord();}catch(error){this.app.diagnosticError=`History checkpoint: ${error.message}`;}
+    this.drainingWrites=drainWrites;
+    this.running=false;clearTimeout(this.timer);clearTimeout(this.publishTimer);clearTimeout(this.presentationTimer);clearTimeout(this.autoTimer);clearInterval(this.maintenanceTimer);
+    this.providers.cancelAllOptions();for(const job of this.pending.values())job.controller.abort();
+    if(!drainWrites)for(const slot of this.writes.values())slot.pending=null;
+    this.app.archive.flush();
+  }
+  deferRecord(callback) {
+    this.flushRecord();
+    const job={callback,frame:null,timer:null};this.recordJob=job;
+    const run=()=>{if(this.recordJob!==job)return;this.recordJob=null;
+      clearTimeout(job.timer);if(job.frame!==null && typeof cancelAnimationFrame==="function")cancelAnimationFrame(job.frame);
+      if(this.running)callback();};
+    // rAF is only a paint optimization, never a dependency for persistence.
+    // Its fallback also bounds pending work if a visible tab becomes hidden.
+    if(typeof requestAnimationFrame==="function" && (typeof document==="undefined" || document.visibilityState!=="hidden")) {
+      job.frame=requestAnimationFrame(()=>{if(this.recordJob===job)setTimeout(run,0);});job.timer=setTimeout(run,100);
+    } else job.timer=setTimeout(run,0);
+  }
+  flushRecord() {
+    const job=this.recordJob;if(!job)return;
+    this.cancelRecord();if(this.running)job.callback();
+  }
+  cancelRecord() {
+    const job=this.recordJob;this.recordJob=null;if(!job)return;
+    clearTimeout(job.timer);if(job.frame!==null && typeof cancelAnimationFrame==="function")cancelAnimationFrame(job.frame);
+  }
+  resume() {
+    if(!this.running || this.starting)return;
+    this.maintain();
+    const now=Date.now(),period=marketState(now,this.state.holidays).open?10_000:60_000;
+    if(!this.busy && (!this.lastQuoteAttemptAt || now-this.lastQuoteAttemptAt>=period)) {
+      clearTimeout(this.timer);this.nextQuoteAt=0;this.tick();
+    }
+  }
   allowed(stock) {return this.running && !!stock && resultsAllowed(stock,this.state.calendar,this.state.window,Date.now());}
+  adoptCanonicalQuote(identity,incoming,missingReason="Groww quote unavailable; showing last verified values") {
+    const sameIdentity=value=>value?.symbol===identity.symbol && stockKey(value)===stockKey(identity);
+    const point=value=>sameIdentity(value) && value.priceSource===PRICE_SOURCE && value.spot>0 && value.previousClose>0 &&
+      Number.isFinite(value.dayPct) && Number.isFinite(value.quoteAt);
+    const candidates=[this.state.identities[identity.symbol],...this.state.stocks.filter(s=>s.symbol===identity.symbol)]
+      .filter(value=>point(value) && value.quoteAt<=Date.now()+10_000);
+    const prior=candidates.reduce((best,value)=>!best || value.quoteAt>best.quoteAt || value.quoteAt===best.quoteAt && value.quoteConflictAt?value:best,null);
+    const base={...identity,...(prior || {}),symbol:identity.symbol,gsin:identity.gsin,searchId:identity.searchId,rank:identity.rank};
+    const rejected=(reason,conflict=false)=>({
+      display:{...base,...(!prior?{spot:null,previousClose:null,dayPct:null,quoteAt:null,priceSource:PRICE_SOURCE}:{}),
+        priceError:reason,quoteWarning:null,rejectedQuoteAt:incoming?.quoteAt || null,...(conflict?{quoteConflictAt:Math.max(base.quoteConflictAt || 0,incoming?.quoteAt || 0)}:{})},
+      observation:{...(sameIdentity(incoming)?incoming:identity),spot:incoming?.spot || null,priceSource:PRICE_SOURCE,priceError:reason},rejected:true,conflict,
+    });
+    if(Number.isFinite(incoming?.quoteAt) && incoming.quoteAt>Date.now()+10_000)return rejected("Groww source timestamp is in the future; last verified values retained");
+    if(!point(incoming) || incoming.priceError)return rejected(incoming?.priceError || missingReason);
+    const sameValues=prior && incoming.spot===prior.spot && incoming.previousClose===prior.previousClose && incoming.dayPct===prior.dayPct;
+    if(base.quoteConflictAt && incoming.quoteAt<=base.quoteConflictAt)
+      return rejected("Conflicting Groww quote; waiting for a strictly newer source timestamp",true);
+    if(prior && incoming.quoteAt<prior.quoteAt)return {
+      display:{...base,quoteWarning:"Older Groww quote ignored; last verified values retained",rejectedQuoteAt:incoming.quoteAt},
+      observation:base,rejected:true,conflict:false,
+    };
+    if(prior && incoming.quoteAt===prior.quoteAt && !sameValues)
+      return rejected("Conflicting Groww quotes at the same source time; last verified values shown",true);
+    const canonical=prior && incoming.quoteAt===prior.quoteAt?prior:incoming;
+    return {display:{...base,...canonical,symbol:identity.symbol,gsin:identity.gsin,searchId:identity.searchId,rank:identity.rank,
+      priceError:null,quoteWarning:null,quoteConflictAt:null,rejectedQuoteAt:null},observation:incoming,rejected:false,conflict:false};
+  }
+  selected(stock) {
+    if(stock?.symbol===this.app.selectedSymbol && this.app.selectedStock)return true;
+    for(const value of this.selectedContexts.values())if(value.symbol===stock?.symbol && Date.now()-value.at<45_000)return true;
+    return false;
+  }
   cancelStock(stock) {
     if(!stock?.symbol)return;
     const symbol=stock.symbol;
-    this.optionGeneration.set(symbol,(this.optionGeneration.get(symbol) || 0)+1);
-    this.providers.cancelOptions(symbol);
-    for(const [key,controller] of this.optionControllers)if(key.startsWith(symbol+"|"))controller.abort();
+    this.optionGeneration.set(symbol,(this.optionGeneration.get(symbol) || 0)+1);this.providers.cancelOptions(symbol);
+    for(const [key,job] of this.pending)if(job.stock.symbol===symbol){job.controller.abort();this.pending.delete(key);this.optionControllers.delete(key);}
     for(const [key,item] of Object.entries(this.state.options))if(item.symbol===symbol || key.startsWith(symbol+"|"))delete this.state.options[key];
+    for(const [key,value] of this.selectedContexts)if(value.symbol===symbol)this.selectedContexts.delete(key);
+    delete this.state.identities[symbol];
+    for(const [key,entry] of Object.entries(this.engine.states))if(entry.identity?.symbol===symbol || key===stockKey(stock)){delete this.engine.states[key];this.checkpointDirty=true;}
+    delete this.state.signals[stockKey(stock)];
   }
   enforceResults() {
-    this.state.engine=this.engine.snapshot();
-    scrubResults(this.state,Date.now(),this.providers.lastMembership || null,stock=>this.cancelStock(stock));
-  }
-  async publish() {
-    if (!this.running)return;
-    this.enforceResults();this.state.diagnosticError=this.app.archive.error;
-    const copy=JSON.parse(JSON.stringify(this.state));
-    const removed=this.app.acceptSnapshot(copy);this.app.render(removed);
-    // Preserve calendar update order even when prices and option responses finish together.
-    this.publishTail=this.publishTail.catch(()=>{}).then(()=>{
-      if(!this.running)return;
-      if((this.state.calendar?.fetchedAt || 0)>(copy.calendar?.fetchedAt || 0)) {
-        Object.assign(copy,{calendar:this.state.calendar,window:this.state.window,holidays:this.state.holidays});scrubResults(copy);
-      }
-      return storage.set("snapshot",copy);
-    });
-    await this.publishTail;
-  }
-  async refreshCalendar(force) {
-    if (this.calendarBusy || !this.running)return;this.calendarBusy=true;
-    try {
-      const result=await this.providers.calendar(force);
-      if (!this.running)return;
-      Object.assign(this.state,result);this.state.calendarError=null;this.nextCalendar=Date.now()+3_600_000;
-    } catch(e) {
-      this.state.calendarError=e.message;this.nextCalendar=Date.now()+300_000;
-      if (this.providers.holidayData) {
-        this.state.holidays=this.providers.holidayData;
-        try {this.state.window=sessionWindow(istDay(Date.now()),this.state.holidays);} catch {}
-      }
+    const membership=this.providers.lastMembership || this.membership;
+    scrubResults(this.state,Date.now(),membership,stock=>this.cancelStock(stock));
+    for(const [key,entry] of Object.entries(this.engine.states)) {
+      const identity=entry.identity || this.state.identities[entry.symbol];
+      if(!identity || !this.allowed(identity)){if(identity)this.cancelStock(identity);delete this.engine.states[key];}
     }
-    finally {this.calendarBusy=false;await this.publish();}
+  }
+  deriveSignals(now=Date.now()) {
+    const views={};this.signalViews={};
+    for(const stock of this.state.stocks) {
+      const view=this.engine.view(stock,now),{baselineEvents,confirmation,...display}=view;
+      this.signalViews[stockKey(stock)]=view;
+      views[stockKey(stock)]={...display,confirmation:confirmation?{firstSeen:confirmation.firstSeen,confirmedAt:confirmation.confirmedAt,lastSeen:confirmation.lastSeen}:null};
+    }
+    this.state.signals=views;this.signalAt=now;
+  }
+  displaySnapshot() {
+    const now=Date.now();this.enforceResults();
+    this.state.membershipStale=!this.state.membershipUpdatedAt || now-this.state.membershipUpdatedAt>=300_000;
+    const cooldown=this.providers.transport?.cooldownState?.();
+    this.state.samplingCooldown=cooldown?.paused?{until:cooldown.retryAt,label:cooldown.scope==="host"?"Groww rate limit":"Groww stock quote service",...cooldown}:null;
+    const summaries={},options={};
+    for(const [key,value] of Object.entries(this.state.options)) {
+      // Unloaded metadata is only useful to an expanded panel. Keep hot cross-tab snapshots small.
+      summaries[key]={...value,items:(value.items || []).filter(item=>item.bookLoaded)};
+      const identity=value.stockRef || this.state.identities[value.symbol];
+      if(identity && this.selected(identity))options[key]=value;
+    }
+    const {engine:unused,options:allOptions,...state}=this.state;
+    return {...state,stocks:[...this.state.stocks],signals:{...this.state.signals},identities:{...this.state.identities},options,optionSummaries:summaries,
+      diagnosticError:this.app.archive.error,revision:++this.revision};
+  }
+  present() {
+    const snapshot=this.displaySnapshot();
+    const removed=this.app.acceptSnapshot(snapshot);this.app.render(removed);
+    if(this.checkpointDirty)this.checkpoint();
+    this.pendingSnapshot=true;
+  }
+  publish(immediate=false,urgent=false) {
+    if(!this.running)return Promise.resolve();
+    // Calendar exclusions and quote batches reach the owner immediately. Repeated
+    // option-stage status changes share one ordinary presentation, not one render per request.
+    immediate=immediate || (this.state.calendar?.fetchedAt || 0)>(this.app.snapshot.calendar?.fetchedAt || 0);
+    if(immediate || urgent){clearTimeout(this.presentationTimer);this.presentationTimer=null;this.present();}
+    else if(!this.presentationTimer)this.presentationTimer=setTimeout(()=>{
+      this.presentationTimer=null;if(this.running){this.present();this.schedulePublication();}
+    },50);
+    if(immediate)return this.flushPublication();
+    if(urgent)this.schedulePublication();
+    return Promise.resolve();
+  }
+  schedulePublication() {
+    if(!this.publishTimer)this.publishTimer=setTimeout(()=>{this.publishTimer=null;this.flushPublication();},100);
+  }
+  // At most one write and one latest replacement per key; slow storage cannot grow a polling queue.
+  writeLatest(key,value) {
+    let slot=this.writes.get(key);
+    if(!slot){slot={pending:null,promise:null};this.writes.set(key,slot);}
+    slot.pending=value;
+    if(!slot.promise)slot.promise=(async()=>{
+      while(slot.pending && (this.running || this.drainingWrites)) {
+        let next=slot.pending;slot.pending=null;
+        if(key==="snapshot")next=this.app.snapshot;
+        try {await storage.set(key,next);this.state.storageError=null;}
+        catch(error){this.state.storageError=`Local storage: ${error.message}`;}
+      }
+    })().finally(()=>{slot.promise=null;if(slot.pending && (this.running || this.drainingWrites))return this.writeLatest(key,slot.pending);});
+    return slot.promise;
+  }
+  flushPublication() {
+    if(this.presentationTimer){clearTimeout(this.presentationTimer);this.presentationTimer=null;if(this.running)this.present();}
+    clearTimeout(this.publishTimer);this.publishTimer=null;
+    if(!this.running || !this.pendingSnapshot)return this.publishTail;
+    this.pendingSnapshot=false;this.publishTail=this.writeLatest("snapshot",this.app.snapshot);return this.publishTail;
+  }
+  checkpoint() {
+    this.enforceResults();
+    this.checkpointDirty=false;
+    return this.writeLatest("engineCheckpoint",{engine:this.engine.snapshot(),updatedAt:this.state.updatedAt,ownerStartedAt:this.state.ownerStartedAt});
+  }
+  async refreshMembership(force=false) {
+    if(!this.running || this.membershipBusy)return;this.membershipBusy=true;
+    try {
+      const result=await this.providers.membership(force);if(!this.running)return;
+      this.membership=result.stocks;this.state.membershipUpdatedAt=result.membershipFetchedAt || this.state.membershipUpdatedAt || 0;
+      this.state.membershipError=result.membershipError || null;
+      const previous=new Map(this.state.stocks.map(stock=>[stock.symbol,stock]));
+      this.state.stocks=result.stocks.map(identity=>{
+        const prior=[this.state.identities[identity.symbol],previous.get(identity.symbol)]
+          .filter(value=>value && stockKey(value)===stockKey(identity) && (!Number.isFinite(value.quoteAt) || value.quoteAt<=Date.now()+10_000))
+          .sort((a,b)=>(b.quoteAt || 0)-(a.quoteAt || 0) || Number(!!b.quoteConflictAt)-Number(!!a.quoteConflictAt))[0];
+        const stock={...identity,...(prior || {}),symbol:identity.symbol,gsin:identity.gsin,searchId:identity.searchId,name:identity.name,rank:identity.rank};
+        if(!prior){stock.spot=null;stock.dayPct=null;stock.quoteAt=null;stock.priceSource=PRICE_SOURCE;stock.priceError="Awaiting Groww stock quote";}
+        this.state.identities[stock.symbol]=stock;return stock;
+      });
+      this.enforceResults();this.deriveSignals();this.publish();
+    } catch(error){this.state.membershipError=error.message;this.publish();}
+    finally {this.membershipBusy=false;this.nextMembership=Date.now()+60_000;}
+  }
+  async refreshCalendar(force=false) {
+    if(this.calendarBusy || !this.running)return;this.calendarBusy=true;let valid=false;
+    try {
+      const result=await this.providers.calendar(force);if(!this.running)return;
+      Object.assign(this.state,result);this.state.calendarError=null;this.nextCalendar=Date.now()+3_600_000;valid=true;
+    } catch(error) {
+      this.state.calendarError=error.message;this.nextCalendar=Date.now()+300_000;
+      if(this.providers.holidayData){this.state.holidays=this.providers.holidayData;try{this.state.window=sessionWindow(istDay(Date.now()),this.state.holidays);}catch{}}
+    } finally {
+      this.calendarBusy=false;
+      if(this.running){this.enforceResults();this.deriveSignals();this.publish(true);}
+    }
+    // Quote immediately when the calendar unblocks candidates, never wait for an old closed/empty poll slot.
+    if(valid && !this.starting){if(this.busy)this.quoteRequested=true;else this.tick();}
     this.prefetch();
   }
+  maintain() {
+    if(!this.running)return;
+    const now=Date.now();
+    if(now>=this.nextMembership)this.refreshMembership(false);
+    if(now>=this.nextCalendar || this.state.calendar?.day!==istDay(now))this.refreshCalendar(false);
+    this.prefetch();
+  }
+  scheduleQuote(started) {
+    if(!this.running)return;
+    const now=Date.now(),period=marketState(now,this.state.holidays).open?10_000:60_000;
+    if(!this.nextQuoteAt)this.nextQuoteAt=started+period;
+    while(this.nextQuoteAt<=now)this.nextQuoteAt+=period;
+    const opening=Date.parse(`${istDay(now)}T09:15:00+05:30`);
+    const openingDelay=now<opening?opening-now:Infinity;
+    const delay=Math.max(1,Math.min(this.nextQuoteAt-now,openingDelay));
+    clearTimeout(this.timer);this.timer=setTimeout(()=>this.tick(),delay);
+  }
   async tick() {
-    if (!this.running || this.busy)return;
-    this.busy=true;const started=Date.now();
+    if(!this.running)return;
+    if(this.busy){this.quoteRequested=true;return;}
+    this.busy=true;const started=Date.now();this.lastQuoteAttemptAt=started;
     try {
-      const stocks=await this.providers.movers(stock=>this.allowed(stock));
-      if (!this.running)return;
-      const now=Date.now();this.state.stocks=stocks;this.state.updatedAt=now;this.state.error=null;
-      this.enforceResults();
-      const market=marketState(now,this.state.holidays);
-      if (market.open) {
-        const transitions=this.engine.observe(this.state.stocks,now);
-        try {this.app.archive.append(diagnosticFrame(this.state.stocks,this.engine,now,{calendar:this.state.calendar,window:this.state.window,settings:this.app.settings},transitions));}
-        catch(e) {this.app.diagnosticError=e.message;}
-      }
-      await this.publish();this.prefetch();
-    } catch(e) {
-      this.state.error=e.message;
-      if(marketState(Date.now(),this.state.holidays).open)this.app.archive.append({schema:2,signalVersion:SIGNAL_VERSION,at:Date.now(),day:istDay(Date.now()),error:e.message});
-      await this.publish();
-    }
-    finally {
+      const candidates=(this.providers.lastMembership || this.membership || []).filter(stock=>this.allowed(stock));
+      if(!candidates.length){this.state.stocks=[];this.enforceResults();this.deriveSignals();this.publish(false,true);return;}
+      const stocks=await this.providers.quotes(candidates,0,{allow:()=>this.running});
+      if(!this.running)return;
+      // Membership can finish refreshing while quotes are in flight. Project the
+      // response onto the latest list instead of restoring the request's old list.
+      const now=Date.now(),latest=this.providers.lastMembership || this.membership || [];
+      const received=new Map(stocks.filter(Boolean).map(stock=>[stockKey(stock),stock])),observations=[];
+      this.state.stocks=latest.filter(stock=>this.allowed(stock)).map(identity=>{
+        const incoming=received.get(stockKey(identity));
+        const adopted=this.adoptCanonicalQuote(identity,incoming,incoming?undefined:"Awaiting the next Groww stock quote; last verified values retained");
+        if(incoming)observations.push(adopted.observation);
+        return adopted.display;
+      });
+      this.state.updatedAt=now;this.state.processedAt=now;this.state.error=null;
+      for(const stock of this.state.stocks)this.state.identities[stock.symbol]=stock;
+      this.enforceResults();const market=marketState(now,this.state.holidays);
+      const transitions=market.open?this.engine.observe(observations,now):[];
+      this.deriveSignals(now);
+      this.publish(false,true);
+      const observedStocks=this.state.stocks,views=this.signalViews,context={calendar:this.state.calendar,window:this.state.window,settings:this.app.settings};
+      const record=()=>{
+        if(!this.running)return;
+        if(market.open)try{this.app.archive.append(diagnosticFrame(observedStocks,{view:stock=>views[stockKey(stock)]},now,context,transitions));}catch(error){this.app.diagnosticError=error.message;}
+        this.checkpoint();
+      };
+      // Give the new prices a frame before checkpoint serialization or archive work.
+      this.deferRecord(record);
+      this.prefetch();
+    } catch(error) {
+      this.state.error=error.message;this.deriveSignals();this.publish(false,true);
+      if(marketState(Date.now(),this.state.holidays).open)try{this.app.archive.append({schema:3,signalVersion:SIGNAL_VERSION,at:Date.now(),day:istDay(Date.now()),error:error.message});}catch{}
+    } finally {
       this.busy=false;
-      if (this.running) {
-        if (Date.now()>=this.nextCalendar || this.state.calendar?.day!==istDay(Date.now())) this.refreshCalendar(false);
-        clearTimeout(this.timer);this.timer=setTimeout(()=>this.tick(),nextPollDelay(started,Date.now(),this.state.holidays));
-      }
+      if(this.quoteRequested && this.running){this.quoteRequested=false;clearTimeout(this.timer);this.timer=setTimeout(()=>this.tick(),0);}
+      else this.scheduleQuote(started);
     }
   }
   prefetch() {
-    if (!this.running)return;
-    const now=Date.now(), market=marketState(now,this.state.holidays);
-    const candidates=rankStocks(this.state.stocks,this.engine,now,{calendar:this.state.calendar,window:this.state.window,settings:this.app.settings}).filter(s=>stockCheck(s,this.state.calendar,this.state.window,now,this.app.settings).pass).slice(0,10);
-    for (const stock of candidates) {
-      const old=this.state.options[`${stock.symbol}|nearest`];
-      const refresh=optionRefreshPolicy(old,now,market);
-      if (refresh.due) this.loadOptions(stock,null,refresh.force);
-    }
+    if(!this.running || this.starting || Date.now()<this.nextAutoAt)return;
+    if(this.pending.size)return;
+    const now=Date.now(),market=marketState(now,this.state.holidays);
+    if(!market.open || !this.state.membershipUpdatedAt || now-this.state.membershipUpdatedAt>=300_000)return;
+    const facade={view:stock=>this.state.signals[stockKey(stock)] || this.engine.view(stock,now)};
+    const candidates=rankStocks(this.state.stocks,facade,now,{calendar:this.state.calendar,window:this.state.window,settings:this.app.settings})
+      .filter(stock=>stockCheck(stock,this.state.calendar,this.state.window,now,this.app.settings).pass).slice(0,10);
+    const stock=candidates.find(stock=>optionRefreshPolicy(this.state.options[`${stock.symbol}|nearest`],now,market).due);
+    if(!stock)return;
+    const refresh=optionRefreshPolicy(this.state.options[`${stock.symbol}|nearest`],now,market);
+    this.nextAutoAt=now+3000;this.loadOptions(stock,null,refresh.force,3,false);
+    clearTimeout(this.autoTimer);this.autoTimer=setTimeout(()=>this.prefetch(),3000);
   }
-  async loadOptions(stock,expiry,force,requestedLimit=3) {
-    if(!this.allowed(stock)) {this.cancelStock(stock);return;}
-    const key=`${stock.symbol}|${expiry || "nearest"}`;
-    const limit=Math.max(3,Math.min(100,Math.max(requestedLimit,this.state.options[key]?.loadedLimit || 0)));
-    if (this.pending.has(key)) {
-      await this.pending.get(key);
-      if ((this.state.options[key]?.loadedLimit || 0)<limit && this.allowed(stock) && !this.state.options[key]?.error) return this.loadOptions(stock,expiry,force,limit);
-      return;
+  async loadOptions(stock,expiry=null,force=false,requestedLimit=3,selected=this.selected(stock)) {
+    if(!this.allowed(stock)){this.cancelStock(stock);return;}
+    stock=this.state.identities[stock.symbol] || stock;
+    const key=`${stock.symbol}|${expiry || "nearest"}`,priority=selected?1:2;
+    if(selected) {
+      // A selected panel preempts background work, including a background request for this same key.
+      for(const [otherKey,job] of this.pending)if(job.priority>1 || otherKey!==key || force || requestedLimit>job.limit) {
+        job.controller.abort();this.providers.cancelOptions(job.stock.symbol);this.pending.delete(otherKey);this.optionControllers.delete(otherKey);
+        if(this.state.options[otherKey]?.loading)this.state.options[otherKey]={...this.state.options[otherKey],loading:false,state:"unavailable",error:"Request superseded by selected calls",fetchedAt:Date.now()};
+      }
     }
-    const generation=this.optionGeneration.get(stock.symbol) || 0,controller=new AbortController();
-    const allow=()=>this.allowed(stock) && !controller.signal.aborted && (this.optionGeneration.get(stock.symbol) || 0)===generation;
-    this.optionControllers.set(key,controller);
-    const task=(async()=>{
-      this.state.options[key]={...(this.state.options[key] || {}),symbol:stock.symbol,loading:true,requestedAt:Date.now()};await this.publish();
+    const limit=Math.max(3,Math.min(100,Math.max(requestedLimit,this.state.options[key]?.loadedLimit || 0)));
+    const oldJob=this.pending.get(key);
+    if(oldJob){await oldJob.promise;if((this.state.options[key]?.loadedLimit || 0)<limit && this.allowed(stock) && !this.state.options[key]?.error)return this.loadOptions(stock,expiry,force,limit,selected);return;}
+    const generation=this.optionGeneration.get(stock.symbol) || 0,controller=new AbortController(),job={stock,controller,priority,limit,promise:null};
+    const allow=()=>this.allowed(stock) && !controller.signal.aborted && (this.optionGeneration.get(stock.symbol) || 0)===generation && this.pending.get(key)===job;
+    this.pending.set(key,job);this.optionControllers.set(key,controller);
+    const requestedAt=Date.now(),deadlineAt=selected?requestedAt+15_000:null;
+    this.state.options[key]={...(this.state.options[key] || {}),symbol:stock.symbol,stockRef:stock,loading:true,state:"queued",requestedAt,deadlineAt};this.publish();
+    job.promise=(async()=>{
+      // Permit an immediate calendar change to cancel work before provider entry.
+      await Promise.resolve();
       try {
         if(!allow())return;
-        const result=await this.providers.options(stock,expiry,force,limit,this.app.settings,stock.symbol===this.app.selectedSymbol?1:2,{signal:controller.signal,allow});
-        if(allow())this.state.options[key]={...result,loadedLimit:result.loadedLimit || limit,loading:false};
-      }
-      catch(e) {if(allow() && e.name!=="AbortError")this.state.options[key]={symbol:stock.symbol,error:e.message,loading:false,fetchedAt:Date.now()};}
-      finally {
-        if(this.pending.get(key)===task)this.pending.delete(key);
-        if(this.optionControllers.get(key)===controller)this.optionControllers.delete(key);
-        const entries=Object.entries(this.state.options).sort((a,b)=>(b[1].fetchedAt || b[1].requestedAt || 0)-(a[1].fetchedAt || a[1].requestedAt || 0));
-        this.state.options=Object.fromEntries(entries.slice(0,30));await this.publish();
+        const result=await this.providers.options(stock,expiry,force,limit,this.app.settings,priority,{signal:controller.signal,allow,stockQuote:stock,deadlineMs:selected?15_000:undefined,
+          onState:status=>{if(!allow())return;const value=this.state.options[key];if(value.state!==status.state){this.state.options[key]={...value,state:status.state,retryAt:status.retryAt};this.publish();}}});
+        if(allow()) {
+          const {stockQuote,...snapshot}=result;
+          const identity=this.state.identities[stock.symbol] || stock;
+          const adopted=stockQuote?this.adoptCanonicalQuote(identity,stockQuote):null;
+          const stockRef=adopted?.display || identity;
+          // A selected stock outside membership still receives a fresh canonical
+          // underlying quote. It never re-enters the scanner through a call response.
+          if(adopted)this.state.identities[stock.symbol]=stockRef;
+          if(adopted?.conflict || adopted && !quoteFresh(stockRef,Date.now())) {
+            const member=this.state.stocks.findIndex(value=>value.symbol===stock.symbol);
+            if(member>=0)this.state.stocks[member]={...stockRef,rank:this.state.stocks[member].rank};
+            this.engine.observe([adopted.observation],Date.now());this.checkpointDirty=true;this.deriveSignals();
+            throw new Error(stockRef.priceError || "Groww underlying quote is stale or unavailable");
+          }
+          this.state.options[key]={...snapshot,symbol:stock.symbol,stockRef,loadedLimit:result.loadedLimit || limit,loading:false,state:"ready"};
+        }
+      } catch(error) {
+        if(allow() && error.name!=="AbortError") {
+          const retryAt=error.retryAt || this.state.options[key]?.retryAt || this.providers.transport?.cooldownState?.(error.url)?.retryAt;
+          this.state.options[key]={...this.state.options[key],symbol:stock.symbol,stockRef:this.state.identities[stock.symbol] || stock,error:error.message,loading:false,state:retryAt>Date.now()?"cooldown":"unavailable",retryAt,fetchedAt:Date.now()};
+        }
+      } finally {
+        if(this.pending.get(key)===job){this.pending.delete(key);this.optionControllers.delete(key);}
+        if(!controller.signal.aborted && this.running)this.trimOptions();
+        if(this.running)this.publish();
       }
     })();
-    this.pending.set(key,task);return task;
+    return job.promise;
+  }
+  trimOptions() {
+    const entries=Object.entries(this.state.options).sort((a,b)=>Number(this.selected(b[1].stockRef))-Number(this.selected(a[1].stockRef)) ||
+      (b[1].fetchedAt || b[1].requestedAt || 0)-(a[1].fetchedAt || a[1].requestedAt || 0));
+    this.state.options=Object.fromEntries(entries.slice(0,30));
   }
   async command(command) {
-    if (!this.running || !command.id || this.seenCommands.has(command.id) || Date.now()-command.at>30_000)return;
+    if(!this.running || !command.id || this.seenCommands.has(command.id) || Date.now()-command.at>30_000)return;
     this.seenCommands.add(command.id);if(this.seenCommands.size>100)this.seenCommands.delete(this.seenCommands.values().next().value);
-    if (command.action==="flush-archive") {await this.app.archive.flush();this.state.diagnosticsFlushId=command.id;await this.publish();}
-    if (command.action==="calendar") await this.refreshCalendar(true);
-    if (command.action==="refresh") await this.tick();
-    if (command.action==="options") {
-      const stock=this.state.stocks.find(s=>s.symbol===command.symbol);
-      if (this.allowed(stock)) await this.loadOptions(stock,command.expiry,command.force===true,command.limit || 3);
+    if(command.action==="flush-archive"){await this.app.archive.flush();this.state.diagnosticsFlushId=command.id;this.publish();await this.flushPublication();}
+    if(command.action==="calendar")await this.refreshCalendar(true);
+    if(command.action==="refresh"){this.refreshMembership(true);await this.tick();}
+    if(command.action==="options") {
+      const stock=this.state.stocks.find(s=>s.symbol===command.symbol) || this.state.identities[command.symbol];
+      if(this.allowed(stock)) {
+        if(command.selected!==false)this.selectedContexts.set(command.requester || this.app.id,{symbol:stock.symbol,at:Date.now()});
+        await this.loadOptions(stock,command.expiry,command.force===true,command.limit || 3,command.selected!==false);
+      }
     }
   }
 }
